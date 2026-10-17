@@ -2,218 +2,245 @@
 
 namespace App\Http\Controllers\Admin;
 
-use App\Services\Billing\DeletionGuard;
-use App\Exceptions\Billing\BillingException;
-use App\Http\Controllers\Controller;
-use App\Models\Client;
-use App\Models\Invoice;
-use App\Models\Order;
-use App\Services\Billing\InvoiceService;
-use Barryvdh\DomPDF\Facade\Pdf;
-use Illuminate\Http\RedirectResponse;
+use App\Http\Controllers\Controller; 
 use Illuminate\Http\Request;
-use Illuminate\Http\Response;
-use Illuminate\View\View;
-
-class InvoiceController extends Controller
-{
-
-    public function unpaidBootstrap(Request $request): View
-    {
-        return view('admin.invoices.index', $this->invoiceListData($request, 'unpaid'));
+use App\Models\Invoice;
+use App\Models\Frontend;
+use App\Models\InvoiceItem;
+use App\Models\Domain;
+use App\Models\Hosting;
+use App\Models\Transaction;
+use App\Lib\SendServiceEmail;
+use App\Models\Deposit;
+use PDF;
+ 
+class InvoiceController extends Controller{ 
+    
+    protected function with($with = []){
+        $array = ['order', 'user', 'payments.gateway'];
+        return array_merge($array, $with);  
+    }  
+ 
+    public function invoices(){  
+        $pageTitle = 'All Invoice'; 
+        $invoices = $this->invoiceData();
+        return view('admin.invoice.all', compact('pageTitle', 'invoices'));
     }
 
-    public function paidBootstrap(Request $request): View
-    {
-        return view('admin.invoices.index', $this->invoiceListData($request, 'paid'));
+    public function cancelled(){
+        $pageTitle = 'Cancelled Invoice'; 
+        $invoices = $this->invoiceData('cancelled');
+        return view('admin.invoice.all', compact('pageTitle', 'invoices'));
     }
 
-    public function overdueBootstrap(Request $request): View
-    {
-        return view('admin.invoices.index', $this->invoiceListData($request, 'overdue'));
+    public function paid(){  
+        $pageTitle = 'Paid Invoices'; 
+        $invoices = $this->invoiceData('paid');
+        return view('admin.invoice.all', compact('pageTitle', 'invoices'));
     }
 
-    public function cancelledBootstrap(Request $request): View
-    {
-        return view('admin.invoices.index', $this->invoiceListData($request, 'cancelled'));
+    public function unpaid(){  
+        $pageTitle = 'Unpaid Invoices'; 
+        $invoices = $this->invoiceData('unpaid');
+        return view('admin.invoice.all', compact('pageTitle', 'invoices'));
     }
 
-    /**
-     * Pratinjau versi Bootstrap -- data & filter sama persis, cuma
-     * tampilannya beda. Halaman asli tidak tersentuh.
-     */
-    public function invoicesBootstrap(Request $request): View
-    {
-        return view('admin.invoices.index', $this->invoiceListData($request, null));
+    public function paymentPending(){  
+        $pageTitle = 'Payment Pending Invoices'; 
+        $invoices = $this->invoiceData('paymentPending');
+        return view('admin.invoice.all', compact('pageTitle', 'invoices'));
     }
 
-    private function invoiceListData(Request $request, ?string $status): array
-    {
-        $invoices = Invoice::query()
-            ->with('client')
-            ->when($status, fn ($q) => $q->where('status', $status))
-            ->when($request->search, fn ($q) => $q->where('invoice_number', 'like', "%{$request->search}%"))
-            ->latest()
-            ->paginate(10)
-            ->withQueryString();
-
-        return ['invoices' => $invoices, 'activeStatus' => $status];
+    public function refunded(){  
+        $pageTitle = 'Refunded Invoices'; 
+        $invoices = $this->invoiceData('refunded');
+        return view('admin.invoice.all', compact('pageTitle', 'invoices'));
     }
 
-    /**
-     * Route ini sudah ada di routes/admin.php sejak lama tapi method-nya
-     * belum pernah dibuat -- klik tombol download PDF di panel admin
-     * selalu 404. Memakai template PDF yang SAMA dengan
-     * Client\InvoiceController::downloadPdf() (client.invoices.pdf)
-     * supaya invoice yang dilihat admin & klien identik persis, bukan
-     * dua template yang bisa diam-diam berbeda.
-     */
-    public function pdf(Invoice $invoice): Response
-    {
-        $invoice->load(['order', 'items.order', 'client']);
+    public function details($id){   
+        $pageTitle = 'Invoice Details';
+        $invoice = Invoice::findOrFail($id);
+        return view('admin.invoice.details', compact('pageTitle', 'invoice'));
+    }
+    
+    public function updateInvoice(Request $request){
+ 
+        $request->validate([
+            'invoice_id'=>'required',
+            'created'=>'required|date_format:d-m-Y',
+            'due_date'=>'required|date_format:d-m-Y',
+            'paid_date'=>'nullable|date_format:d-m-Y',
+            'items'=>'sometimes|array',
+            'items.amount*'=>'required|numeric',
+            'status'=>'required|integer|in:'.Invoice::status(true),
+        ]);
+        /**
+        * For knowing about status 
+        * @see \App\Models\Invoice go to status method 
+        */
+        $invoice = Invoice::where('status', '!=', 5)->findOrFail($request->invoice_id); //5 means Refunded
+      
+        foreach(@$request->items ?? [] as $id => $value){ 
+            $item = InvoiceItem::where('id', $id)->where('invoice_id', $invoice->id)->first(); 
+          
+            if(!$item){
+                $item = new InvoiceItem();
+                $item->invoice_id = $invoice->id;
+                $item->user_id = $invoice->user_id;
+            }
 
-        $pdf = Pdf::loadView('client.invoices.pdf', compact('invoice'))->setPaper('a4');
+            if(substr($value['amount'], 0, 1) == '-'){
+                $item->trx_type = '-';
+            }else{
+                $item->trx_type = '+';
+            }
 
-        return $pdf->download("Invoice-{$invoice->invoice_number}.pdf");
+            $item->amount = $value['amount']; 
+            $item->description = $value['description'];
+            $item->save();
+        }
+  
+        $invoice->amount = $invoice->items->sum('amount');
+ 
+        $invoice->status = $request->status;
+        $invoice->created = $request->created;
+        $invoice->due_date = $request->due_date;
+        $invoice->paid_date = $request->paid_date;
+        $invoice->admin_notes = $request->admin_notes;
+
+        $invoice->save();
+
+        $notify[] = ['success', 'Invoice items updated successfully'];
+        return back()->withNotify($notify);
     }
 
-    public function detailsBootstrap(Invoice $invoice): View
-    {
-        $invoice->load(['client', 'order', 'items.order']);
+    public function download($id, $view = null){
+    
+        $invoice = Invoice::findOrFail($id);
+        $items = $invoice->items->groupBy(['hosting_id', 'domain_id']);
 
-        return view('admin.invoices.details', compact('invoice'));
-    }
+        $address = Frontend::where('data_keys','invoice_address.content')->first();
+        $user = $invoice->user;
+        $pageTitle = 'Invoice';
 
-    public function createBootstrap(): View
-    {
-        $clients = Client::orderBy('name')->get();
-        $orders = Order::orderBy('order_number')->get();
+        $data = [
+            'pageTitle' => $pageTitle, 
+            'invoice' => $invoice,
+            'user' => $user,
+            'address' => $address,
+            'items' => $items,
+        ];
 
-        return view('admin.invoices.form', ['invoice' => new Invoice(), 'clients' => $clients, 'orders' => $orders]);
-    }
+        $pdf = PDF::loadView('invoice', $data)->setOptions(['defaultFont' => 'sans-serif', 'enable_remote' => true]);
 
-    public function store(Request $request, InvoiceService $invoices): RedirectResponse
-    {
-        $data = $this->validated($request);
-
-        $invoices->create($data);
-
-        return redirect()->route('admin.invoices')->with('success', 'Invoice berhasil dibuat.');
-    }
-
-    public function editBootstrap(Invoice $invoice): View
-    {
-        $invoice->load('items.order');
-        $clients = Client::orderBy('name')->get();
-        $orders = Order::orderBy('order_number')->get();
-
-        return view('admin.invoices.form', ['invoice' => $invoice, 'clients' => $clients, 'orders' => $orders]);
-    }
-
-    public function update(Request $request, Invoice $invoice, InvoiceService $invoices): RedirectResponse
-    {
-        $data = $this->validated($request);
-
-        if ($data['status'] === 'paid' && ! $invoice->paid_at) {
-            $data['paid_at'] = now();
+        if($view){
+            return $pdf->stream('invoice.pdf');
         }
 
-        $invoices->update($invoice, $data);
-
-        return redirect()->route('admin.invoices')->with('success', 'Invoice berhasil diperbarui.');
+        return $pdf->download('invoice.pdf');
     }
 
-    public function destroy(Invoice $invoice, DeletionGuard $guard): RedirectResponse
-    {
-        $reason = $guard->deleteLocked($invoice, fn ($i) => $guard->forInvoice($i));
+    public function deleteInvoiceItem(Request $request){
 
-        if ($reason) {
-            return back()->with('error', $reason);
-        }
-
-        $guard->audit('invoice', "Invoice {$invoice->invoice_number} dihapus",
-            "Soft delete, bisa dipulihkan: php artisan records:restore invoice {$invoice->id}", $invoice->client_id);
-
-        return redirect()->route('admin.invoices')->with('success', 'Invoice dihapus (soft delete, bisa dipulihkan lewat php artisan records:restore).');
-    }
-
-    /**
-     * Tandai invoice lunas.
-     */
-    public function markPaid(Request $request, InvoiceService $invoices): RedirectResponse
-    {
-        try {
-            $invoice = $invoices->findOrFail((int) $request->input('invoice_id'));
-            $invoices->markPaid($invoice, $request->input('payment_method'));
-        } catch (BillingException $e) {
-            return back()->with('error', $e->getMessage());
-        }
-
-        return back()->with('success', "Invoice {$invoice->invoice_number} ditandai lunas.");
-    }
-
-    /**
-     * Tandai invoice belum lunas (batalkan status lunas).
-     */
-    public function markUnpaid(Request $request, InvoiceService $invoices): RedirectResponse
-    {
-        try {
-            $invoice = $invoices->findOrFail((int) $request->input('invoice_id'));
-            $invoices->markUnpaid($invoice);
-        } catch (BillingException $e) {
-            return back()->with('error', $e->getMessage());
-        }
-
-        return back()->with('success', "Invoice {$invoice->invoice_number} ditandai belum lunas.");
-    }
-
-    /**
-     * Batalkan invoice. Pelepasan renewal_invoice_id di domain/hosting
-     * terkait (supaya layanan tidak macet permanen) ada di
-     * InvoiceService::cancel(), bukan di sini lagi.
-     */
-    public function cancel(Request $request, InvoiceService $invoices): RedirectResponse
-    {
-        try {
-            $invoice = $invoices->findOrFail((int) $request->input('invoice_id'));
-            $invoices->cancel($invoice);
-        } catch (BillingException $e) {
-            return back()->with('error', $e->getMessage());
-        }
-
-        return back()->with('success', "Invoice {$invoice->invoice_number} dibatalkan.");
-    }
-
-    /**
-     * Simpan catatan invoice (memakai kolom "notes" yang sudah ada sejak Fase 2).
-     */
-    public function invoiceNotes(Request $request): RedirectResponse
-    {
-        $data = $request->validate([
-            'invoice_id' => ['required', \Illuminate\Validation\Rule::exists('invoices', 'id')->whereNull('deleted_at')],
-            'notes' => ['nullable', 'string'],
+        $request->validate([
+            'invoice_id'=>'required',
+            'id'=>'required',
         ]);
 
-        $invoice = Invoice::findOrFail($data['invoice_id']);
-        $invoice->update(['notes' => $data['notes']]);
+        $invoice = Invoice::findOrFail($request->invoice_id);
 
-        return back()->with('success', 'Catatan invoice berhasil disimpan.');
+        InvoiceItem::where('id', $request->id)->where('invoice_id', $invoice->id)->firstOrFail()->delete();
+        $totalAmount = InvoiceItem::where('invoice_id', $invoice->id)->sum('amount');
+
+        $invoice->amount = $totalAmount;        
+        $invoice->save();        
+
+        $notify[] = ['success', 'Invoice item deleted successfully'];
+        return back()->withNotify($notify);
     }
 
-    private function validated(Request $request): array
-    {
-        return $request->validate([
-            'client_id'      => ['required', 'exists:clients,id'],
-            'order_id'       => ['nullable', \Illuminate\Validation\Rule::exists('orders', 'id')->whereNull('deleted_at')],
-            'amount'         => ['required', 'numeric', 'min:0'],
-            'tax'            => ['nullable', 'numeric', 'min:0'],
-            'discount'      => ['nullable', 'numeric', 'min:0'],
-            'tax_id'        => ['nullable', 'exists:taxes,id'],
-            'status'         => ['required', 'in:unpaid,paid,overdue,cancelled,refunded'],
-            'issue_date'     => ['required', 'date'],
-            'due_date'       => ['required', 'date', 'after_or_equal:issue_date'],
-            'payment_method' => ['nullable', 'string', 'max:100'],
-            'notes'          => ['nullable', 'string'],
+    public function refundInvoice(Request $request){
+    
+        $request->validate([
+            'invoice_id'=>'required',
+            'amount'=>'nullable|numeric|gt:0',
         ]);
+
+        $invoice = Invoice::paid()->findOrFail($request->invoice_id);
+        $amount = $request->amount;
+        $user = $invoice->user;
+
+        if($amount > $invoice->amount){
+            $notify[] = ['error', 'Sorry, Refund amount must be less than invoice amount'];
+            return back()->withNotify($notify);
+        }
+
+        $refundAmount = $amount ?? $invoice->amount;
+
+        $invoice->status = 5; //5 means Refunded
+        /**
+        * For knowing about status 
+        * @see \App\Models\Invoice go to status method 
+        */
+        $invoice->refund_amount = $refundAmount;
+        $invoice->save();
+
+        $user->balance += $refundAmount;
+        $user->save();
+
+        $transaction = new Transaction();
+        $transaction->user_id = $user->id;
+        $transaction->amount = $refundAmount;
+        $transaction->post_balance = $user->balance;
+        $transaction->charge = 0;
+        $transaction->trx_type = '+';
+        $transaction->details = 'Invoice refund';
+        $transaction->trx =  getTrx();
+        $transaction->save();
+
+        SendServiceEmail::invoiceRefund($invoice, $refundAmount, $transaction->trx);
+
+        $notify[] = ['success', 'Invoice refunded successfully'];
+        return back()->withNotify($notify);
     }
-}
+
+    public function domainInvoices($id){
+        $domain = Domain::findOrFail($id);
+        $pageTitle = 'All Invoices - '.$domain->domain;
+
+        $invoicesItems = InvoiceItem::where('domain_id', $domain->id)->groupBy('invoice_id')
+                        ->where('item_type', 1)->with('invoice', 'domain', 'user')->orderBy('id', 'DESC')->paginate(getPaginate());
+
+        return view('admin.invoice.all_item', compact('pageTitle', 'invoicesItems', 'domain'));
+    }
+
+    public function hostingInvoices($id){ 
+        $hosting = Hosting::findOrFail($id);
+        $pageTitle = 'All Invoices';
+
+        $invoicesItems = InvoiceItem::where('hosting_id', $hosting->id)->where('item_type', 0)->groupBy('invoice_id')
+                        ->with('invoice', 'hosting', 'user')->orderBy('id', 'DESC')->paginate(getPaginate());
+
+        return view('admin.invoice.all_item', compact('pageTitle', 'invoicesItems', 'hosting'));
+    }
+
+    protected function invoiceData($scope = null){
+
+        if($scope){
+            $invoices = Invoice::$scope()->with($this->with());
+        }else{
+            $invoices = Invoice::with($this->with());
+        }
+
+        $invoices = $invoices->searchable(['user:username'])->dateFilter()->orderBy('id','desc')->paginate(getPaginate());
+        return $invoices;
+    }
+
+    public function paymentTransactions($id){
+        $invoice = Invoice::findOrFail($id);
+        $pageTitle = 'Payment History of Invoice #'.$invoice->id;
+        $deposits = Deposit::where('invoice_id', $invoice->id)->with(['user', 'gateway', 'invoice'])->paginate(getPaginate());
+        return view('admin.deposit.log', compact('pageTitle', 'deposits', 'invoice'));
+    }
+
+} 

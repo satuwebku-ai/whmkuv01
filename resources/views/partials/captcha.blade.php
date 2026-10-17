@@ -1,27 +1,39 @@
-{{--
-  Blok verifikasi "saya bukan robot" -- versi Bootstrap.
+@php
+	$customCaptcha = loadCustomCaptcha();
+    $googleCaptcha = loadReCaptcha()
+@endphp
+@if($googleCaptcha)
+    <div class="mb-3">
+        @php echo $googleCaptcha @endphp
+    </div>
+@endif
+@if($customCaptcha)
+    <div class="form-group">
+        <div class="mb-2">
+            @php echo $customCaptcha @endphp
+        </div>
+        <label class="form-label">@lang('Captcha')</label>
+        <input type="text" name="captcha" class="form-control form--control" required>
+    </div>
+@endif
+@if($googleCaptcha)
+@push('script')
+    <script>
+        (function($){
+            "use strict"
+            $('.verify-gcaptcha').on('submit',function(){
+                var response = grecaptcha.getResponse();
+                if (response.length == 0) {
+                    document.getElementById('g-recaptcha-error').innerHTML = '<span class="text--danger">@lang("Captcha field is required.")</span>';
+                    return false;
+                }
+                return true;
+            });
 
-  Dipakai bersama di form login admin, login klien, dan pendaftaran
-  yang sudah dimigrasikan ke Bootstrap. Tidak menampilkan apa-apa kalau
-  CAPTCHA sedang tidak diperlukan.
-
-  Variabel $captcha berasal dari controller (CaptchaService).
---}}
-
-@if (!empty($captcha) && $captcha['required'])
-  <div class="mb-3">
-    @if ($captcha['recaptcha'])
-      <div class="g-recaptcha" data-sitekey="{{ $captcha['site_key'] }}"></div>
-      <script src="https://www.google.com/recaptcha/api.js" async defer></script>
-    @else
-      <label class="form-label small fw-medium text-dark">{{ $captcha['question'] }}</label>
-      <input type="number" name="captcha_answer" required autocomplete="off"
-             class="form-control form-control-sm" placeholder="Jawaban">
-      <p class="text-muted mt-1 mb-0" style="font-size:11px">
-        Pertanyaan sederhana ini muncul karena ada beberapa percobaan masuk yang gagal.
-      </p>
-    @endif
-
-    @error('captcha') <p class="text-danger mt-1 mb-0" style="font-size:12px">{{ $message }}</p> @enderror
-  </div>
+            window.verifyCaptcha = () => {
+                document.getElementById('g-recaptcha-error').innerHTML = '';
+            }
+        })(jQuery);
+    </script>
+@endpush
 @endif

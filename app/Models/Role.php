@@ -2,85 +2,84 @@
 
 namespace App\Models;
 
+use App\Models\Permission;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 
-/**
- * Role RBAC per Master Blueprint (12 role staf: superadmin, administrator,
- * finance, billing, domain_manager, hosting_manager, support, marketing,
- * developer, devops, auditor, viewer).
- *
- * SENGAJA berjalan BERDAMPINGAN dengan sistem lama (kolom `admins.role`
- * string + `admins.permissions` json per-modul), bukan menggantikannya:
- * sistem lama mendukung override modul KUSTOM per-admin individual (mis.
- * "staff A boleh akses billing meski role staff biasanya tidak"), sesuatu
- * yang tidak bisa direpresentasikan kalau akses HANYA ditentukan oleh
- * role. Middleware `module:xxx`/`role:xxx` yang dipakai di seluruh
- * routes/admin.php tetap membaca sistem lama itu supaya tidak ada
- * satupun dari puluhan definisi route yang perlu diubah atau berisiko
- * rusak. Tabel roles/permissions ini disinkron otomatis dari kolom lama
- * lewat Admin::booted() (lihat komentar di sana) dan dari sini
- * blueprint-compliant hasRole()/hasPermission() tersedia untuk kode baru
- * yang mau memakai pola RBAC berbasis tabel.
- */
 class Role extends Model
 {
-    protected $fillable = ['name', 'slug', 'description', 'is_system'];
-
-    protected function casts(): array
-    {
-        return ['is_system' => 'boolean'];
-    }
-
-    /**
-     * 12 role staf sesuai Master Blueprint. Dipakai RoleSeeder saat
-     * migrasi awal dan oleh Admin::syncRoleFromLegacyColumn() untuk
-     * memetakan nilai lama `admins.role` ('superadmin'/'admin'/'staff')
-     * ke slug role yang setara di tabel ini. Alias lama `admin` dan `staff`
-     * dipetakan ke `administrator` dan `support`.
-     */
-    public const ROLES = [
-        'superadmin'      => 'Super Admin',
-        'administrator'   => 'Administrator',
-        'finance'         => 'Finance',
-        'billing'         => 'Billing',
-        'domain_manager'  => 'Domain Manager',
-        'hosting_manager' => 'Hosting Manager',
-        'support'         => 'Support',
-        'marketing'       => 'Marketing',
-        'developer'       => 'Developer',
-        'devops'          => 'DevOps',
-        'auditor'         => 'Auditor',
-        'viewer'          => 'Viewer',
-    ];
-
-    public const DESCRIPTIONS = [
-        'superadmin'      => 'Akses penuh ke seluruh modul dan manajemen admin.',
-        'administrator'   => 'Mengelola operasional harian tanpa mengubah akses admin.',
-        'finance'         => 'Fokus pada laporan keuangan, invoice, dan rekonsiliasi pembayaran.',
-        'billing'         => 'Mengelola invoice, pembayaran, dan payment gateway.',
-        'domain_manager'  => 'Mengelola domain, registrar, DNS, dan verifikasi dokumen.',
-        'hosting_manager' => 'Mengelola hosting account, VPS, server, dan provisioning.',
-        'support'         => 'Menangani live chat, tiket support, dan kebutuhan klien.',
-        'marketing'       => 'Mengelola produk, konten, promo, dan affiliate.',
-        'developer'       => 'Akses teknis untuk infrastruktur, konsol, dan konfigurasi.',
-        'devops'          => 'Menangani server, backup, cron job, dan aktivitas sistem.',
-        'auditor'         => 'Akses terbatas untuk meninjau aktivitas dan konfigurasi sistem.',
-        'viewer'          => 'Akses monitoring terbatas untuk kebutuhan laporan dan operasional.',
-    ];
-
-    public function permissions(): BelongsToMany
+    public function permissions()
     {
         return $this->belongsToMany(Permission::class);
     }
 
-    public function admins(): BelongsToMany
+    public static function hasPermission($code = null)
     {
-        return $this->belongsToMany(Admin::class);
+        $admin = Auth::guard('admin')->user();
+
+        if ($admin->id == 1) {
+            return true;
+        }
+
+        $roleName        = $admin->role->name;
+        $permissionCache = $roleName . '_permission';
+        $permissions     = Cache::get($permissionCache);
+
+        if (!$permissions) {
+            $permissions = $admin->role->permissions->pluck('code')->toArray();
+            Cache::put($permissionCache, $permissions);
+        }
+
+        if (is_array($code)) {
+
+            $permissionsInString = implode(', ', $permissions);
+            $codesInString       = implode(', ', $code);
+
+            if (str_contains($codesInString, '*')) {
+                foreach ($code as $route) {
+                    $route = str_replace('*', '', $route);
+                    if (str_contains($permissionsInString, $route)) {
+                        return true;
+                    }
+                }
+            }
+
+            if (empty(array_intersect($code, $permissions))) {
+                return false;
+            }
+            return true;
+        }
+        
+
+        $allPermissions = Cache::get('AllPermissions');
+        if (!$allPermissions) {
+            $allPermissions = Permission::select('code')->get()->pluck('code')->toArray();
+            Cache::put('AllPermissions', $allPermissions);
+        }
+
+        $routeName = $code ?? request()->route()->getName();
+        if (in_array($routeName, $allPermissions) && !in_array($routeName, $permissions)) {
+            return false;
+        }
+
+        return true;
     }
 
-    public function hasPermission(string $slug): bool
+    protected static function boot()
     {
-        return $this->permissions()->where('slug', $slug)->exists();
+        parent::boot();
+        if (!app()->runningInConsole() || !app()->runningUnitTests()) {
+            $roles = static::get()->map(function ($role) {
+                return $role->name . '_permission';
+            })->toArray();
+
+            static::saved(function () use ($roles) {
+                foreach ($roles as $value) {
+                    \Cache::forget($value);
+                }
+            });
+        }
     }
+
 }

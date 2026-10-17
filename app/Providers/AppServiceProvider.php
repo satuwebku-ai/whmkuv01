@@ -2,36 +2,99 @@
 
 namespace App\Providers;
 
-use App\Notifications\Channels\WhatsAppChannel;
-use App\Support\CspNonce;
-use App\Support\MailConfig;
-use Illuminate\Queue\Events\JobProcessing;
-use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Blade;
-use Illuminate\Support\Facades\Notification;
+use App\Constants\Status;
+use App\Lib\Searchable;
+use App\Models\AdminNotification;
+use App\Models\CancelRequest;
+use App\Models\Deposit;
+use App\Models\Frontend;
+use App\Models\Invoice;
+use App\Models\Order;
+use App\Models\ServiceCategory;
+use App\Models\SupportTicket;
+use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Pagination\Paginator;
 
 class AppServiceProvider extends ServiceProvider
 {
+    /**
+     * Register any application services.
+     */
     public function register(): void
     {
-        $this->app->singleton(CspNonce::class);
+        Builder::mixin(new Searchable);
     }
 
+    /**
+     * Bootstrap any application services.
+     */
     public function boot(): void
     {
-        // <script @nonce> => <script nonce="..."> (nonce sama dengan header CSP).
-        Blade::directive('nonce', fn () => '<?php echo \'nonce="\' . e(app(\App\Support\CspNonce::class)->value()) . \'"\'; ?>');
+        if (!cache()->get('SystemInstalled')) {
+            $envFilePath = base_path('.env');
+            if (!file_exists($envFilePath)) {
+                header('Location: install');
+                exit;
+            }
+            $envContents = file_get_contents($envFilePath);
+            if (empty($envContents)) {
+                header('Location: install');
+                exit;
+            } else {
+                cache()->put('SystemInstalled', true);
+            }
+        }
 
-        // Daftarkan channel WhatsApp supaya bisa dipakai lewat
-        // Notification::route() maupun method via() di kelas notifikasi.
-        Notification::extend(WhatsAppChannel::class, fn ($app) => $app->make(WhatsAppChannel::class));
 
-        // SMTP dari Pengaturan → Email (database) menimpa MAIL_* di .env.
-        MailConfig::apply();
+        $viewShare['emptyMessage'] = 'Data not found';
+        view()->share($viewShare);
 
-        // Worker antrean berjalan lama; muat ulang tiap job supaya perubahan
-        // pengaturan langsung berlaku tanpa restart worker.
-        Event::listen(JobProcessing::class, fn () => MailConfig::apply());
+
+        view()->composer('admin.partials.sidenav', function ($view) {
+            $view->with([
+                'bannedUsersCount'           => User::banned()->count(),
+                'emailUnverifiedUsersCount' => User::emailUnverified()->count(),
+                'mobileUnverifiedUsersCount'   => User::mobileUnverified()->count(),
+                'kycUnverifiedUsersCount'   => User::kycUnverified()->count(),
+                'kycPendingUsersCount'   => User::kycPending()->count(),
+                'pendingTicketCount'         => SupportTicket::whereIN('status', [Status::TICKET_OPEN, Status::TICKET_REPLY])->count(),
+                'pendingDepositsCount'    => Deposit::pending()->count(),
+
+                'pendingOrderCount' => Order::pending()->count(),
+                'unpaidInvoiceCount'    => Invoice::unpaid()->count(),
+                'pendingCancelRequestCount'    => CancelRequest::pending()->count(),
+                'countAutomationError'    => AdminNotification::where('api_response', 1)->where('is_read', 0)->count(),
+            ]);
+        });
+
+        $activeTemplate = activeTemplate();
+        view()->composer([$activeTemplate.'partials.header', $activeTemplate.'layouts.side_bar', $activeTemplate.'layouts.master_side_bar'], function ($view) {
+            $view->with([
+                'serviceCategories'=> ServiceCategory::active()->get(['id', 'name', 'slug']),
+            ]);
+        });
+
+        view()->composer('admin.partials.topnav', function ($view) {
+            $view->with([
+                'adminNotifications' => AdminNotification::where('is_read', Status::NO)->with('user')->orderBy('id', 'desc')->take(10)->get(),
+                'adminNotificationCount' => AdminNotification::where('is_read', Status::NO)->count(),
+            ]);
+        });
+
+        view()->composer('partials.seo', function ($view) {
+            $seo = Frontend::where('data_keys', 'seo.data')->first();
+            $view->with([
+                'seo' => $seo ? $seo->data_values : $seo,
+            ]);
+        });
+
+        if (gs('force_ssl')) {
+            \URL::forceScheme('https');
+        }
+
+
+        Paginator::useBootstrapFive();
     }
 }
