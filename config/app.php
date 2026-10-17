@@ -1,6 +1,5 @@
 <?php
-use Illuminate\Support\Facades\Facade;
-require_once('timezone.php');
+
 return [
 
     /*
@@ -66,7 +65,7 @@ return [
     |
     */
 
-    'timezone' => $timezone,
+    'timezone' => 'UTC',
 
     /*
     |--------------------------------------------------------------------------
@@ -102,7 +101,7 @@ return [
 
     'previous_keys' => [
         ...array_filter(
-            explode(',', env('APP_PREVIOUS_KEYS', ''))
+            explode(',', (string) env('APP_PREVIOUS_KEYS', ''))
         ),
     ],
 
@@ -123,20 +122,5 @@ return [
         'driver' => env('APP_MAINTENANCE_DRIVER', 'file'),
         'store' => env('APP_MAINTENANCE_STORE', 'database'),
     ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Class Aliases
-    |--------------------------------------------------------------------------
-    |
-    | This array of class aliases will be registered when this application
-    | is started. However, feel free to register as many as you wish as
-    | the aliases are "lazy" loaded so they don't hinder performance.
-    |
-    */
-
-    'aliases' => Facade::defaultAliases()->merge([
-        'Status'=>App\Constants\Status::class
-    ])->toArray(),
 
 ];

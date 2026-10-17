@@ -1,0 +1,394 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Services\Billing\DeletionGuard;
+use App\Exceptions\Billing\BillingException;
+use App\Http\Controllers\Controller;
+use App\Models\Invoice;
+use App\Models\Payment;
+use App\Models\PaymentGateway;
+use App\Services\Billing\InvoiceService;
+use App\Services\Payment\PaymentGatewayFactory;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\View\View;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+class PaymentController extends Controller
+{
+
+    public function paymentsBootstrap(Request $request): View
+    {
+        return view('admin.payments.index', $this->listData($request, null));
+    }
+
+    public function initiatedBootstrap(Request $request): View
+    {
+        return view('admin.payments.index', $this->listData($request, 'initiated'));
+    }
+
+    public function pendingBootstrap(Request $request): View
+    {
+        return view('admin.payments.index', $this->listData($request, 'pending'));
+    }
+
+    public function paidBootstrap(Request $request): View
+    {
+        return view('admin.payments.index', $this->listData($request, 'paid'));
+    }
+
+    public function failedBootstrap(Request $request): View
+    {
+        return view('admin.payments.index', $this->listData($request, 'failed'));
+    }
+
+    public function refundedBootstrap(Request $request): View
+    {
+        return view('admin.payments.index', $this->listData($request, 'refunded'));
+    }
+
+    private function listData(Request $request, ?string $status): array
+    {
+        $payments = Payment::query()
+            ->with(['client', 'invoice', 'gateway'])
+            ->when($status, fn ($q) => $q->where('status', $status))
+            ->when($request->search, fn ($q) => $q->where('reference', 'like', "%{$request->search}%"))
+            ->latest()
+            ->paginate(10)
+            ->withQueryString();
+
+        return ['payments' => $payments, 'activeStatus' => $status];
+    }
+
+    public function detailsBootstrap(Payment $payment): View
+    {
+        $payment->load(['client', 'invoice', 'gateway']);
+
+        return view('admin.payments.details', compact('payment'));
+    }
+
+    /**
+     * Sajikan bukti transfer lewat rute Laravel yang butuh login admin —
+     * bukan lewat symlink public/storage.
+     *
+     * Dua alasan sekaligus:
+     *  1. Beberapa hosting shared (termasuk yang dipakai di sini) memblokir
+     *     Apache mengikuti symlink karena kebijakan keamanan, membuat
+     *     `storage/...` selalu mengembalikan 403 meski `artisan storage:link`
+     *     sudah berhasil. Menyajikan lewat PHP tidak bergantung symlink itu.
+     *  2. URL publik `storage/payment-proofs/...` bisa diakses SIAPA SAJA
+     *     tanpa login — bukti transfer sering memuat nama & sebagian nomor
+     *     rekening. Lewat rute ini, hanya admin yang login yang bisa buka.
+     */
+    public function proof(Payment $payment): StreamedResponse|Response
+    {
+        if (! $payment->proof_path || ! Storage::disk('local')->exists($payment->proof_path)) {
+            abort(404, 'Bukti transfer tidak ditemukan.');
+        }
+
+        return Storage::disk('local')->response($payment->proof_path);
+    }
+
+    public function createBootstrap(Request $request): View
+    {
+        $invoices = Invoice::with('client')
+            ->whereIn('status', ['unpaid', 'overdue'])
+            ->latest()
+            ->get();
+
+        $gateways = PaymentGateway::where('is_active', true)->orderBy('sort_order')->get();
+
+        return view('admin.payments.form', compact('invoices', 'gateways'));
+    }
+
+    public function store(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'invoice_id'         => ['required', \Illuminate\Validation\Rule::exists('invoices', 'id')->whereNull('deleted_at')],
+            'payment_gateway_id' => ['required', 'exists:payment_gateways,id'],
+        ]);
+
+        $invoice = Invoice::findOrFail($data['invoice_id']);
+        $gateway = PaymentGateway::findOrFail($data['payment_gateway_id']);
+
+        if ($invoice->status === 'paid') {
+            return back()->with('error', 'Invoice ini sudah lunas, tidak perlu pembayaran baru.');
+        }
+
+        /*
+         * Cegah dua admin membuat payment aktif untuk invoice yang sama.
+         * Query biasa "cek lalu insert" tidak cukup karena dua request dapat
+         * melewati cek sebelum salah satunya melakukan INSERT.
+         */
+        $state = Cache::lock("payment-create:invoice:{$invoice->id}", 120)->get(function () use ($invoice, $gateway) {
+            return DB::transaction(function () use ($invoice, $gateway) {
+                $invoice = Invoice::query()->lockForUpdate()->findOrFail($invoice->id);
+
+                if ($invoice->status === 'paid') {
+                    return ['paid' => true];
+                }
+
+                $existing = Payment::where('invoice_id', $invoice->id)
+                    ->whereIn('status', ['initiated', 'pending'])
+                    ->latest('id')
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($existing) {
+                    return [
+                        'payment_id' => $existing->id,
+                        'existing' => true,
+                    ];
+                }
+
+                $amount = (float) $invoice->total;
+                $fee = $gateway->calculateFee($amount);
+
+                $payment = Payment::create([
+                    'invoice_id'         => $invoice->id,
+                    'client_id'          => $invoice->client_id,
+                    'payment_gateway_id' => $gateway->id,
+                    'amount'             => $amount,
+                    'fee'                => $fee,
+                    'total'              => $amount + $fee,
+                    'currency'           => $gateway->currency,
+                    'status'             => 'initiated',
+                ]);
+
+                return [
+                    'payment_id' => $payment->id,
+                    'existing' => false,
+                ];
+            });
+        });
+
+        if (! is_array($state)) {
+            return back()->with('error', 'Pembayaran sedang dibuat oleh request lain. Silakan coba lagi sebentar.');
+        }
+
+        if ($state['paid'] ?? false) {
+            return back()->with('error', 'Invoice ini sudah lunas, tidak perlu pembayaran baru.');
+        }
+
+        $payment = Payment::findOrFail($state['payment_id']);
+
+        if ($state['existing'] ?? false) {
+            return redirect()->route('admin.payments.details', $payment)
+                ->with('error', 'Sudah ada pembayaran berjalan untuk invoice ini (' . $payment->reference . '). Selesaikan atau batalkan dulu sebelum membuat yang baru.');
+        }
+
+        $result = $this->createGatewayTransactionOnce($payment, $gateway);
+
+        if (! $result['success'] && ($result['busy'] ?? false)) {
+            return redirect()->route('admin.payments.details', $payment)
+                ->with('error', $result['message']);
+        }
+
+        if (! $result['success']) {
+            $payment->update(['status' => 'failed', 'gateway_response' => ['error' => $result['message']]]);
+
+            return redirect()->route('admin.payments.details', $payment)
+                ->with('error', 'Gagal membuat transaksi di gateway: ' . $result['message']);
+        }
+
+        $payment->update([
+            'payment_url'      => $result['payment_url'],
+            'external_id'      => $result['external_id'],
+            'gateway_response' => $result['raw'],
+        ]);
+
+        return redirect()->route('admin.payments.details', $payment)
+            ->with('success', $result['message']);
+    }
+
+    /**
+     * Serialisasi HTTP call ke gateway untuk invoice+gateway yang sama.
+     * Lock database pada pembuatan row tidak boleh ditahan selama call
+     * eksternal, sehingga lock cache dipakai untuk fase provider-nya.
+     */
+    private function createGatewayTransactionOnce(Payment $payment, PaymentGateway $gateway): array
+    {
+        $result = Cache::lock(
+            "payment-gateway-init:{$payment->invoice_id}:{$gateway->id}",
+            120
+        )->get(function () use ($payment, $gateway) {
+            $payment->refresh();
+
+            if ($payment->external_id || $payment->payment_url) {
+                return [
+                    'success' => true,
+                    'message' => 'Pembayaran sudah berhasil diinisialisasi.',
+                    'payment_url' => $payment->payment_url,
+                    'external_id' => $payment->external_id,
+                    'raw' => $payment->gateway_response,
+                ];
+            }
+
+            return PaymentGatewayFactory::make($gateway)->createTransaction($payment);
+        });
+
+        return is_array($result) ? $result : [
+            'success' => false,
+            'busy' => true,
+            'message' => 'Pembayaran sedang diproses. Silakan coba lagi sebentar.',
+            'payment_url' => null,
+            'external_id' => null,
+            'raw' => null,
+        ];
+    }
+
+    /**
+     * Setujui pembayaran manual — tandai lunas & lunasi invoice.
+     */
+    public function approve(Request $request): RedirectResponse
+    {
+        $payment = Payment::findOrFail($request->input('payment_id'));
+
+        if ($payment->status !== 'pending') {
+            return back()->with('error', 'Approval manual hanya boleh dilakukan untuk pembayaran berstatus pending.');
+        }
+
+        try {
+            app(InvoiceService::class)->assertPayable($payment->invoice);
+        } catch (BillingException $e) {
+            return back()->with('error', $e->getMessage());
+        }
+
+        $payment->update(['admin_note' => $request->input('admin_note')]);
+        $payment->markAsPaid($payment->payment_method ?? 'Transfer Manual');
+
+        return back()->with('success', "Pembayaran {$payment->reference} disetujui. Invoice terkait ditandai lunas.");
+    }
+
+    /**
+     * Tolak pembayaran.
+     */
+    public function reject(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'payment_id' => ['required', \Illuminate\Validation\Rule::exists('payments', 'id')->whereNull('deleted_at')],
+            'admin_note' => ['nullable', 'string'],
+        ]);
+
+        $payment = Payment::findOrFail($data['payment_id']);
+
+        // Payment yang sudah paid/refunded tidak boleh "ditolak": statusnya akan
+        // berbeda dari invoice dan ledger. Pakai aksi Refund untuk payment lunas.
+        if (! in_array($payment->status, ['initiated', 'pending'], true)) {
+            return back()->with('error', 'Hanya pembayaran berstatus initiated/pending yang bisa ditolak.');
+        }
+
+        $payment->update(['status' => 'failed', 'admin_note' => $data['admin_note']]);
+
+        return back()->with('success', "Pembayaran {$payment->reference} ditolak.");
+    }
+
+    /**
+     * Catat refund payment yang sudah lunas. Mengubah status menjadi
+     * `refunded`, yang memicu RefundService lewat hook model Payment:
+     * transaksi pembalik, invoice refunded, komisi affiliate dibalik, dan
+     * kredit top-up ditarik dari saldo klien. Ini HANYA mencatat di sistem;
+     * pengembalian dana ke klien dilakukan terpisah (dashboard Duitku /
+     * transfer), bukan oleh aksi ini.
+     */
+    public function refund(Request $request, Payment $payment): RedirectResponse
+    {
+        $data = $request->validate([
+            'reason' => ['required', 'string', 'min:5', 'max:500'],
+        ], [
+            'reason.required' => 'Tulis alasan refund.',
+            'reason.min' => 'Alasan refund minimal 5 karakter.',
+        ]);
+
+        $admin = auth('admin')->user();
+
+        $refunded = DB::transaction(function () use ($payment, $data, $admin): bool {
+            $locked = Payment::query()->lockForUpdate()->find($payment->id);
+
+            if (! $locked || $locked->status !== 'paid') {
+                return false;
+            }
+
+            $locked->update([
+                'status' => 'refunded',
+                'admin_note' => trim(($locked->admin_note ? $locked->admin_note . "\n" : '')
+                    . '[Refund oleh ' . ($admin->name ?? 'admin') . '] ' . $data['reason']),
+            ]);
+
+            return true;
+        });
+
+        if (! $refunded) {
+            return back()->with('error', 'Hanya pembayaran berstatus paid yang bisa direfund (atau sudah direfund sebelumnya).');
+        }
+
+        \App\Models\ActivityLog::record(
+            'payment',
+            "Payment {$payment->reference} direfund admin",
+            'Rp ' . number_format((float) $payment->total, 0, ',', '.') . " — {$data['reason']} (oleh " . ($admin->name ?? 'admin') . ')',
+            route('admin.payments.details', $payment),
+            'warning',
+            $payment->client_id,
+        );
+
+        return back()->with('success', "Refund {$payment->reference} dicatat. Saldo/invoice/komisi terkait sudah disesuaikan; kembalikan dana ke klien secara terpisah.");
+    }
+
+    /**
+     * Rekonsiliasi manual — tanya status langsung ke gateway.
+     */
+    public function checkStatus(Payment $payment): RedirectResponse
+    {
+        if (! $payment->gateway) {
+            return back()->with('error', 'Pembayaran ini tidak terhubung ke gateway manapun.');
+        }
+
+        $result = PaymentGatewayFactory::make($payment->gateway)->checkStatus($payment);
+
+        if (! $result['success']) {
+            return back()->with('error', 'Gagal cek status: ' . $result['message']);
+        }
+
+        $payable = in_array($payment->status, ['initiated', 'pending'], true);
+
+        if ($result['status'] === 'paid' && $payment->status !== 'paid') {
+            if (! $payable) {
+                return back()->with('error', "Gateway menyatakan LUNAS, tetapi payment berstatus \"{$payment->status}\" sehingga tidak diterapkan otomatis. Periksa invoice, lalu refund atau lunasi manual.");
+            }
+
+            $payment->markAsPaid($payment->payment_method, $result['raw'] ?? []);
+
+            if ($payment->fresh()->status !== 'paid') {
+                return back()->with('error', 'Gateway menyatakan LUNAS, tetapi pembayaran tidak dapat diterapkan ke invoice (lihat catatan pada payment dan log aktivitas).');
+            }
+
+            return back()->with('success', 'Status terverifikasi LUNAS di gateway. Invoice ikut ditandai lunas.');
+        }
+
+        // Payment final (paid/refunded/dst) tidak boleh ditimpa hasil polling.
+        if ($payable && $result['status'] && $result['status'] !== $payment->status) {
+            $payment->update(['status' => $result['status'], 'gateway_response' => $result['raw']]);
+        }
+
+        return back()->with('success', 'Status di gateway: ' . ($result['status'] ?? 'tidak diketahui'));
+    }
+
+    public function destroy(Payment $payment, DeletionGuard $guard): RedirectResponse
+    {
+        $reason = $guard->deleteLocked($payment, fn ($p) => $guard->forPayment($p));
+
+        if ($reason) {
+            return back()->with('error', $reason);
+        }
+
+        $guard->audit('payment', "Pembayaran {$payment->reference} dihapus",
+            "Soft delete, bisa dipulihkan: php artisan records:restore payment {$payment->id}", $payment->client_id);
+
+        return redirect()->route('admin.payments')->with('success', 'Data pembayaran dihapus (soft delete, bisa dipulihkan lewat php artisan records:restore).');
+    }
+}

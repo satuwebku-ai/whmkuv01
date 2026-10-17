@@ -2,149 +2,1598 @@
 
 namespace App\Http\Controllers\Admin;
 
+use App\Services\Billing\DeletionGuard;
 use App\Http\Controllers\Controller;
+use App\Models\Registrar;
+use App\Models\Tld;
+use App\Services\Domain\DomainRegistrarFactory;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use App\Models\DomainSetup;
-use App\Models\DomainPricing;
+use Illuminate\Validation\Rule;
+use Illuminate\View\View;
 
-class TldController extends Controller{
- 
-    public function all(){
-        $pageTitle = 'All Domains/TLD - Top Level Domain';
-        $domains = DomainSetup::orderBy('id', 'DESC')->with('pricing')->paginate(getPaginate());
-        return view('admin.tld.all', compact('pageTitle', 'domains'));
-    }
-
-    public function add(Request $request){
-
-        $request->validate([
-            'extension'=>'required' //Extension means TLD => Top level domain like .com/com
+class TldController extends Controller
+{
+    /**
+     * Simpan harga add-on domain (ID Protection, dst). Bukan diambil dari
+     * Liqu.id — lihat catatan di view TLD Pricing untuk alasannya.
+     */
+    public function updateAddonPricing(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'whois_privacy_price' => ['nullable', 'numeric', 'min:0'],
         ]);
 
-        $extension = $request->extension;
+        \App\Models\Setting::put('whois_privacy_price', $data['whois_privacy_price'] ?? 0, 'domain');
 
-        if(substr($extension, 0, 1) != '.'){
-            $extension = '.'.$extension;
-        }
-       
-        if(DomainSetup::where('extension', $extension)->exists()){
-            $notify[] = ['error', 'The extension has already been taken'];
-            return back()->withNotify($notify);
-        } 
-
-        $domain = new DomainSetup();
-        $domain->extension = $extension;
-        $domain->id_protection = $request->id_protection ? 1 : 0;
-        $domain->save();
-
-        $domainPricing = new DomainPricing();
-        $domainPricing->domain_id = $domain->id;
-        $domainPricing->save();
-
-        $notify[] = ['success', 'Domain extension added successfully'];
-        return back()->withNotify($notify);
+        return back()->with('success', 'Harga add-on domain berhasil disimpan.');
     }
 
-    public function update(Request $request){
-    
-        $request->validate([
-            'id'=>'required',
-            'extension'=>'required' //Extension means TLD => Top level domain like .com/com
-        ]);
-  
-        $extension = $request->extension;
+    /**
+     * Halaman TLD Pricing (BARU, terpisah dari index()/Status TLD) --
+     * sekarang mengharuskan pilih registrar dulu sebelum tabel harga
+     * muncul. Ini jadi wajib sejak satu ekstensi (mis. ".com") bisa
+     * dimiliki BEBERAPA registrar sekaligus (unique per registrar
+     * didefinisikan di migrasi create_tlds_table) -- tanpa
+     * pemilihan registrar, tabel gabungan bakal menampilkan beberapa
+     * baris ".com" berdampingan tanpa konteks jelas yang mana punya
+     * siapa.
+     */
+    public function pricing(Request $request): View
+    {
+        $registrars = Registrar::withCount('tlds')->orderByDesc('is_default')->orderBy('name')->get();
 
-        if(substr($extension, 0, 1) != '.'){
-            $extension = '.'.$extension;
+        $registrarParam = $request->input('registrar');
+        $selected = null;
+        $tlds = null;
+
+        if ($registrarParam === 'none') {
+            $selected = 'none';
+            $tlds = Tld::whereNull('registrar_id')
+                ->when($request->search, fn ($q) => $q->where('extension', 'like', "%{$request->search}%"))
+                ->orderBy('extension')
+                ->paginate(min((int) $request->input('per_page', 25), 200))
+                ->withQueryString();
+        } elseif ($registrarParam) {
+            $registrar = $registrars->firstWhere('id', (int) $registrarParam);
+
+            if ($registrar) {
+                $selected = $registrar;
+                $tlds = Tld::where('registrar_id', $registrar->id)
+                    ->when($request->search, fn ($q) => $q->where('extension', 'like', "%{$request->search}%"))
+                    ->orderBy('extension')
+                    ->paginate(min((int) $request->input('per_page', 25), 200))
+                    ->withQueryString();
+            }
         }
 
-        if(DomainSetup::where('extension', $extension)->where('id', '!=', $request->id)->exists()){
-            $notify[] = ['error', 'The extension has already been taken'];
-            return back()->withNotify($notify);
-        } 
-
-        $domain = DomainSetup::findOrFail($request->id);
-        $domain->extension = $extension;
-        $domain->id_protection = $request->id_protection ? 1 : 0;
-        $domain->save();
-
-        $notify[] = ['success', 'Domain extension updated successfully'];
-        return back()->withNotify($notify);
+        return view('admin.tlds.pricing', compact('registrars', 'selected', 'tlds'));
     }
 
-    public function updatePricing(Request $request){
+    public function pricingBootstrap(Request $request): View
+    {
+        return $this->pricing($request);
+    }
 
-        $request->validate([
-            'id'=>'required|integer',
-
-            'one_year_price'=>'required|numeric',
-            'one_year_id_protection'=>'required|numeric',
-            'one_year_renew'=>'required|numeric',
-
-            'two_year_price'=>'required|numeric',
-            'two_year_id_protection'=>'required|numeric',
-            'two_year_renew'=>'required|numeric',
-
-            'three_year_price'=>'required|numeric',
-            'three_year_id_protection'=>'required|numeric',
-            'three_year_renew'=>'required|numeric',
-
-            'four_year_price'=>'required|numeric',
-            'four_year_id_protection'=>'required|numeric',
-            'four_year_renew'=>'required|numeric',
-
-            'five_year_price'=>'required|numeric',
-            'five_year_id_protection'=>'required|numeric',
-            'five_year_renew'=>'required|numeric',
-
-            'six_year_price'=>'required|numeric',
-            'six_year_id_protection'=>'required|numeric',
-            'six_year_renew'=>'required|numeric',
+    /**
+     * Simpan harga (Modal/Register/Renew/Transfer + harga per tahun)
+     * untuk TLD milik SATU registrar tertentu. Dipisah dari bulkUpdate()
+     * (yang sekarang cuma menangani Aktif/Tampil di Web/Grup di halaman
+     * Status TLD) supaya submit di satu halaman tidak bisa tidak sengaja
+     * mengubah data di halaman lain.
+     *
+     * registrar_id yang dikirim form dicocokkan ulang ke tiap baris --
+     * kalau ada yang tidak cocok (mis. form dimanipulasi manual), baris
+     * itu dilewati, bukan dipaksa disimpan.
+     */
+    public function updatePricing(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'registrar_id'                  => ['nullable'],
+            'rows'                           => ['required', 'array'],
+            'rows.*.cost_register'           => ['nullable', 'numeric', 'min:0'],
+            'rows.*.cost_renew'              => ['nullable', 'numeric', 'min:0'],
+            'rows.*.cost_transfer'           => ['nullable', 'numeric', 'min:0'],
+            'rows.*.register_price'          => ['nullable', 'numeric', 'min:0'],
+            'rows.*.renew_price'             => ['nullable', 'numeric', 'min:0'],
+            'rows.*.transfer_price'          => ['nullable', 'numeric', 'min:0'],
+            'rows.*.year_prices'             => ['nullable', 'array'],
+            'rows.*.year_renew_prices'       => ['nullable', 'array'],
         ]);
 
-        //Minimum one price required for the TLD / Domain
-        if($request->one_year_price < 0 && $request->two_year_price < 0 && 
-           $request->three_year_price < 0 && $request->four_year_price < 0 && 
-           $request->five_year_price < 0 && $request->six_year_price < 0)
-        {
-            $notify[] = ['error', 'Minimum one price required'];
-            return back()->withNotify($notify);
+        $registrarId = $data['registrar_id'] === 'none' ? null : ($data['registrar_id'] ?: null);
+
+        $tlds = Tld::whereIn('id', array_keys($data['rows']))
+            ->where('registrar_id', $registrarId)
+            ->get()
+            ->keyBy('id');
+
+        $changed = 0;
+        $skipped = 0;
+
+        foreach ($data['rows'] as $id => $row) {
+            $tld = $tlds->get((int) $id);
+
+            if (! $tld) {
+                // Baris ini bukan milik registrar yang sedang dibuka --
+                // dilewati diam-diam supaya submit yang dimanipulasi
+                // tidak bisa mengubah TLD registrar lain.
+                $skipped++;
+                continue;
+            }
+
+            $values = [
+                'cost_register'  => $this->toNumber($row['cost_register'] ?? null, $tld->cost_register),
+                'cost_renew'     => $this->toNumber($row['cost_renew'] ?? null, $tld->cost_renew),
+                'cost_transfer'  => $this->toNumber($row['cost_transfer'] ?? null, $tld->cost_transfer),
+                'register_price' => $this->toNumber($row['register_price'] ?? null, $tld->register_price),
+                'renew_price'    => $this->toNumber($row['renew_price'] ?? null, $tld->renew_price),
+                'transfer_price' => $this->toNumber($row['transfer_price'] ?? null, $tld->transfer_price),
+            ];
+
+            // Harga per tahun (2-10 tahun) -- cuma ditimpa kalau memang
+            // dikirim form (lewat modal "Atur Harga per Tahun"), supaya
+            // submit biasa tanpa modal itu tidak menghapus data yang
+            // sudah ada.
+            if (isset($row['year_prices'])) {
+                $values['year_prices'] = array_filter($row['year_prices'], fn ($v) => $v !== null && $v !== '');
+            }
+
+            if (isset($row['year_renew_prices'])) {
+                $values['year_renew_prices'] = array_filter($row['year_renew_prices'], fn ($v) => $v !== null && $v !== '');
+            }
+
+            if ($values['cost_register'] > 0 && (float) $tld->cost_register !== $values['cost_register']) {
+                $values['cost_synced_at'] = now();
+            }
+
+            $tld->fill($values);
+
+            if ($tld->isDirty()) {
+                $tld->save();
+                $changed++;
+            }
         }
 
-        $pricing = DomainPricing::findOrFail($request->id);
+        $msg = "{$changed} TLD berhasil diperbarui.";
 
-        $pricing->one_year_price = $request->one_year_price;
-        $pricing->one_year_id_protection = $request->one_year_id_protection;
-        $pricing->one_year_renew = $request->one_year_renew;
+        if ($skipped > 0) {
+            $msg .= " ({$skipped} baris dilewati karena tidak cocok dengan registrar yang sedang dibuka.)";
+        }
 
-        $pricing->two_year_price = $request->two_year_price;
-        $pricing->two_year_id_protection = $request->two_year_id_protection;
-        $pricing->two_year_renew = $request->two_year_renew;
-
-        $pricing->three_year_price = $request->three_year_price;
-        $pricing->three_year_id_protection = $request->three_year_id_protection;
-        $pricing->three_year_renew = $request->three_year_renew;
-
-        $pricing->four_year_price = $request->four_year_price;
-        $pricing->four_year_id_protection = $request->four_year_id_protection;
-        $pricing->four_year_renew = $request->four_year_renew;
-
-        $pricing->five_year_price = $request->five_year_price;
-        $pricing->five_year_id_protection = $request->five_year_id_protection;
-        $pricing->five_year_renew = $request->five_year_renew;
-
-        $pricing->six_year_price = $request->six_year_price;
-        $pricing->six_year_id_protection = $request->six_year_id_protection;
-        $pricing->six_year_renew = $request->six_year_renew;
-
-        $pricing->save();
-
-        $notify[] = ['success', 'Domain pricing updated successfully'];
-        return back()->withNotify($notify);
+        return back()->with($changed > 0 ? 'success' : 'info', $msg);
     }
 
-    public function status($id){
-        return DomainSetup::changeStatus($id);
+    public function index(Request $request): View
+    {
+        $tlds = Tld::with('registrar')
+            ->when($request->search, fn ($q) => $q->where('extension', 'like', "%{$request->search}%"))
+            ->when($request->status === 'active', fn ($q) => $q->where('is_active', true))
+            ->when($request->status === 'inactive', fn ($q) => $q->where('is_active', false))
+            ->when($request->web === 'shown', fn ($q) => $q->where('show_in_search', true))
+            ->when($request->web === 'hidden', fn ($q) => $q->where('show_in_search', false))
+            ->when($request->registrar === 'none', fn ($q) => $q->whereNull('registrar_id'))
+            ->when($request->registrar && $request->registrar !== 'none', fn ($q) => $q->where('registrar_id', $request->registrar))
+            ->orderByDesc('is_active')
+            ->orderBy('extension')
+            // Bisa diperbesar supaya lebih banyak baris diedit sekaligus.
+            ->paginate(min((int) $request->input('per_page', 25), 200))
+            ->withQueryString();
+
+        $counts = [
+            'all'      => Tld::count(),
+            'active'   => Tld::where('is_active', true)->count(),
+            'inactive' => Tld::where('is_active', false)->count(),
+            // Dipakai untuk memperingatkan bahwa markup tidak akan berpengaruh
+            // pada TLD yang harga modalnya belum terisi.
+            'no_cost'  => Tld::where('cost_register', '<=', 0)->count(),
+            'shown'    => Tld::where('show_in_search', true)->count(),
+            'hidden'   => Tld::where('show_in_search', false)->count(),
+            'home'     => Tld::where('show_on_home', true)->count(),
+            'privacy_eligible' => Tld::where('whois_privacy_eligible', true)->count(),
+        ];
+
+        $registrars = Registrar::where('is_active', true)->orderByDesc('is_default')->orderBy('name')->get();
+
+        $priceCompare = $this->priceComparison($tlds);
+
+        return view('admin.tlds.index', compact('tlds', 'counts', 'registrars', 'priceCompare'));
     }
 
+
+    /**
+     * Halaman BARU: harga TLD yang DISARANKAN registrar untuk
+     * pelanggan mereka sendiri (customer-tld-pricings) dan untuk
+     * sub-reseller (sub-reseller-tld-pricings) -- BEDA dari halaman
+     * "TLD Pricing" di atas yang menyimpan harga MODAL kita sendiri.
+     * Halaman ini murni lihat-lihat/referensi, dipakai untuk
+     * menyusun paket harga sub-reseller sendiri nantinya -- belum ada
+     * tombol "tarik ke sini" karena datanya harga jual REGISTRAR ke
+     * pihak lain, bukan harga modal kita.
+     *
+     * Sama seperti Diagnosa Registrar, dukungan dicek lewat
+     * method_exists() -- BUKAN nama provider -- supaya registrar lain
+     * yang suatu saat menambah method serupa otomatis ikut tampil di
+     * sini tanpa kode ini perlu diubah.
+     */
+    public function registrarPricing(Request $request): View
+    {
+        $registrars = Registrar::where('is_active', true)->orderByDesc('is_default')->orderBy('name')->get();
+
+        $registrarParam = $request->input('registrar');
+        $selected = null;
+        $customerPricing = null;
+        $subResellerPricing = null;
+        $apiErrors = [];
+
+        if ($registrarParam) {
+            $selected = $registrars->firstWhere('id', (int) $registrarParam);
+
+            if ($selected) {
+                $service = DomainRegistrarFactory::make($selected);
+                $supportsAny = false;
+
+                if (method_exists($service, 'listCustomerTldPricings')) {
+                    $supportsAny = true;
+
+                    try {
+                        $result = $service->listCustomerTldPricings();
+
+                        if ($result['success']) {
+                            $customerPricing = $this->normalizeTldPricingRows($result['raw']['data'] ?? []);
+                        } else {
+                            $apiErrors[] = 'Harga pelanggan: ' . $result['message'];
+                        }
+                    } catch (\Throwable $e) {
+                        $apiErrors[] = 'Harga pelanggan: ' . $e->getMessage();
+                    }
+                }
+
+                if (method_exists($service, 'listSubResellerTldPricings')) {
+                    $supportsAny = true;
+
+                    try {
+                        $result = $service->listSubResellerTldPricings();
+
+                        if ($result['success']) {
+                            $subResellerPricing = $this->normalizeSubResellerPackages($result['raw']['data'] ?? []);
+                        } else {
+                            $apiErrors[] = 'Harga sub-reseller: ' . $result['message'];
+                        }
+                    } catch (\Throwable $e) {
+                        $apiErrors[] = 'Harga sub-reseller: ' . $e->getMessage();
+                    }
+                }
+
+                if (! $supportsAny) {
+                    $apiErrors[] = "Registrar {$selected->name} belum mendukung harga pelanggan/sub-reseller lewat halaman ini.";
+                }
+            }
+        }
+
+        return view('admin.tlds.registrar-pricing', compact(
+            'registrars', 'selected', 'customerPricing', 'subResellerPricing', 'apiErrors'
+        ));
+    }
+
+    public function registrarPricingBootstrap(Request $request): View
+    {
+        return $this->registrarPricing($request);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Domain Premium -- lihat catatan panjang di routes/admin.php
+    // untuk bedanya dengan "Harga Reseller/Sub-Reseller" di atas.
+    // ─────────────────────────────────────────────────────────────
+
+    public function premiumPricing(Request $request): View
+    {
+        $registrars = Registrar::where('is_active', true)->orderByDesc('is_default')->orderBy('name')->get();
+
+        $registrarParam = $request->input('registrar');
+        $selected = $registrarParam ? $registrars->firstWhere('id', (int) $registrarParam) : null;
+
+        $familyRows = collect();
+        $genericRows = collect();
+
+        if ($selected) {
+            $order = array_flip(\App\Models\TldPremium::ID_FAMILY);
+
+            $familyRows = \App\Models\TldPremium::where('registrar_id', $selected->id)
+                ->where('is_generic', false)
+                ->get()
+                ->sortBy(fn ($row) => sprintf(
+                    '%03d-%d-%03d',
+                    $order[$row->extension] ?? 999,
+                    $row->is_premium ? 1 : 0,
+                    $row->max_premium_character ?? 0
+                ))
+                ->values();
+
+            // Diurutkan mengikuti posisi di TldPremium::GENERIC_EXTENSIONS
+            // (BUKAN alfabetis) -- urutan itu yang jadi acuan tampilan di
+            // halaman publik Domain Premium (PremiumDomainController::data()
+            // memakai konstanta ini langsung), jadi urutan di admin ikut
+            // disamakan supaya tidak beda dengan yang pengunjung lihat.
+            $genericOrder = array_flip(\App\Models\TldPremium::GENERIC_EXTENSIONS);
+
+            $genericRows = \App\Models\TldPremium::where('registrar_id', $selected->id)
+                ->where('is_generic', true)
+                ->get()
+                ->sortBy(fn ($row) => $genericOrder[$row->extension] ?? 999)
+                ->values();
+        }
+
+        return view('admin.tlds.premium-pricing', compact('registrars', 'selected', 'familyRows', 'genericRows'));
+    }
+
+    public function premiumPricingBootstrap(Request $request): View
+    {
+        return $this->premiumPricing($request);
+    }
+
+    /**
+     * Tarik harga MODAL varian PREMIUM keluarga .id dari DNAMA (GET
+     * /tld-pricings, lewat listTldPricings() -- endpoint modal yang SAMA
+     * dipakai sync "TLD Pricing" biasa lewat listPrices(), BUKAN
+     * /customer-tld-pricings/listCustomerTldPricings() yang isinya harga
+     * SARAN DNAMA untuk pelanggan mereka sendiri, bukan modal kita --
+     * lihat docblock DnamaService::listTldPricings()), lalu simpan ke
+     * tld_premiums.
+     *
+     * Baris REGULER (is_premium = false, mis. ".id" seharga Rp 215rb)
+     * SENGAJA tidak disimpan ke sini -- harga jual .id biasa sepenuhnya
+     * dikelola dari tabel `tlds` lewat halaman "TLD Pricing", yang juga
+     * jadi SATU-SATUNYA sumber harga saat pelanggan order domain (lihat
+     * DomainSearchController). Kalau baris reguler ikut disimpan di sini,
+     * halaman ini menampilkan input "Jual Register/Renew/Transfer" yang
+     * kelihatan bisa diisi tapi tidak berpengaruh apa-apa ke harga yang
+     * sungguhan dibayar pelanggan.
+     *
+     * PENTING: cuma kolom cost_* yang ditimpa di sini. sell_* (harga jual
+     * yang admin isi manual) TIDAK PERNAH disentuh oleh sinkronisasi --
+     * kalau tidak, harga jual yang sudah diatur bisa hilang tiap sinkron
+     * ulang.
+     *
+     * Baris ekstensi generik (is_generic = true) ikut "diseed" di sini
+     * kalau belum ada -- bukan dari API (tidak ada daftar tetapnya),
+     * cuma supaya baris referensinya muncul otomatis saat halaman
+     * pertama kali dibuka untuk registrar ini.
+     */
+    public function syncPremiumPricing(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'registrar_id' => ['required', 'exists:registrars,id'],
+        ]);
+
+        $registrar = Registrar::findOrFail($data['registrar_id']);
+        $service = DomainRegistrarFactory::make($registrar);
+
+        // PENTING: WAJIB listTldPricings() (GET /tld-pricings), BUKAN
+        // listCustomerTldPricings() (GET /customer-tld-pricings). Yang
+        // kedua itu harga yang DNAMA SARANKAN untuk pelanggan MEREKA
+        // sendiri -- bukan harga MODAL yang dibebankan ke saldo reseller
+        // kita (lihat docblock DnamaService::listTldPricings()). Sync
+        // "TLD Pricing" biasa (TldController::syncPreview() ->
+        // DnamaService::listPrices()) sudah benar memakai /tld-pricings;
+        // sebelumnya sinkronisasi harga premium di sini malah memakai
+        // endpoint yang salah, jadi kolom "Harga MODAL" yang ditampilkan
+        // bukan modal sungguhan, dan baris premium yang ikut kebaca pun
+        // lebih sedikit dari yang sebenarnya tersedia (bandingkan dengan
+        // "Statistik & Contoh Harga" di halaman Diagnosa Registrar, yang
+        // memang sengaja diambil dari /tld-pricings).
+        if (! method_exists($service, 'listTldPricings')) {
+            return redirect()->route('admin.tlds.premium-pricing', ['registrar' => $registrar->id])
+                ->with('error', "Registrar {$registrar->name} belum mendukung sinkronisasi harga premium lewat halaman ini.");
+        }
+
+        $result = $service->listTldPricings();
+
+        if (! $result['success']) {
+            return redirect()->route('admin.tlds.premium-pricing', ['registrar' => $registrar->id])
+                ->with('error', 'Gagal mengambil harga dari ' . $registrar->name . ': ' . $result['message']);
+        }
+
+        $wanted = \App\Models\TldPremium::ID_FAMILY;
+        $rows = $result['raw']['data'] ?? [];
+        $synced = 0;
+
+        foreach ($rows as $row) {
+            $ext = $row['tld'] ?? null;
+            $isPremium = (bool) ($row['is_premium'] ?? false);
+
+            if (! $ext || ! in_array($ext, $wanted, true)) {
+                continue;
+            }
+
+            // Baris REGULER (bukan premium) keluarga .id SENGAJA dilewati --
+            // harga jual .id biasa sudah dikelola dari halaman "TLD Pricing"
+            // (tabel `tlds`), yang JUGA dipakai satu-satunya oleh alur order
+            // domain sungguhan (lihat DomainSearchController). Kalau baris
+            // reguler ikut disimpan ke sini, halaman ini menampilkan kolom
+            // "Jual Register/Renew/Transfer" yang KELIHATAN bisa diisi tapi
+            // sebenarnya tidak berpengaruh sama sekali ke harga yang dibayar
+            // pelanggan -- membingungkan admin yang mengira sudah mengatur
+            // harga .id dari sini.
+            if (! $isPremium) {
+                continue;
+            }
+
+            $oneYear = collect($row['pricings'] ?? [])->firstWhere('duration', 1);
+            $maxChar = $row['max_premium_character'] ?? null;
+
+            $label = $ext . ($maxChar ? " ({$maxChar} karakter) Premium" : ' Premium');
+
+            \App\Models\TldPremium::updateOrCreate(
+                [
+                    'registrar_id' => $registrar->id,
+                    'extension' => $ext,
+                    'is_premium' => true,
+                    'max_premium_character' => $maxChar,
+                ],
+                [
+                    'label' => $label,
+                    'is_generic' => false,
+                    'cost_register' => $oneYear['register_price'] ?? null,
+                    'cost_renew' => $oneYear['renewal_price'] ?? null,
+                    'cost_transfer' => $oneYear['transfer_price'] ?? null,
+                    'cost_currency' => $row['currency'] ?? 'IDR',
+                    'cost_synced_at' => now(),
+                ]
+            );
+
+            $synced++;
+        }
+
+        // Bersihkan baris REGULER (is_premium = false) keluarga .id yang
+        // mungkin sudah kadung tersimpan dari sinkronisasi versi lama --
+        // baris itu dead-end (lihat catatan di docblock method ini), jadi
+        // sinkronisasi ulang sekarang jadi kesempatan untuk membereskannya
+        // otomatis tanpa admin perlu utak-atik database manual.
+        \App\Models\TldPremium::where('registrar_id', $registrar->id)
+            ->where('is_generic', false)
+            ->where('is_premium', false)
+            ->delete();
+
+        foreach (\App\Models\TldPremium::GENERIC_EXTENSIONS as $ext) {
+            \App\Models\TldPremium::firstOrCreate(
+                [
+                    'registrar_id' => $registrar->id,
+                    'extension' => $ext,
+                    'is_premium' => true,
+                    'max_premium_character' => null,
+                ],
+                [
+                    'label' => "{$ext} Premium",
+                    'is_generic' => true,
+                ]
+            );
+        }
+
+        $msg = "{$synced} baris harga premium keluarga .id berhasil disinkron dari {$registrar->name}.";
+
+        if ($synced === 0) {
+            $msg = "Sinkron selesai, tapi 0 baris keluarga .id ditemukan di /customer-tld-pricings akun {$registrar->name} -- kemungkinan akun reseller ini belum diberi akses ke TLD premium tersebut oleh DNAMA (lihat jumlah \"Ekstensi unik\" di halaman Diagnosa Registrar untuk baris yang benar-benar tersedia).";
+        }
+
+        // Redirect EKSPLISIT ke halaman ini dengan registrar yang sama
+        // (bukan back()) -- back() bergantung pada URL "sebelumnya" yang
+        // tersimpan di session, yang gampang tertimpa kalau ada tab lain
+        // di sesi yang sama sempat membuka halaman GET lain (mis. tab
+        // Diagnosa Registrar) sebelum tombol Sinkron ini ditekan. Kalau
+        // itu terjadi, back() bisa membawa balik ke halaman TANPA
+        // ?registrar=, yang membuat data terlihat "hilang" padahal
+        // sebenarnya sudah tersimpan di database.
+        return redirect()->route('admin.tlds.premium-pricing', ['registrar' => $registrar->id])
+            ->with($synced > 0 ? 'success' : 'info', $msg);
+    }
+
+    /**
+     * Simpan harga JUAL (sell_register_price dkk) yang diisi manual oleh
+     * admin -- dipisah dari sinkronisasi di atas supaya submit form ini
+     * tidak pernah menimpa cost_* yang berasal dari DNAMA.
+     */
+    public function updatePremiumPricing(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'registrar_id' => ['required', 'exists:registrars,id'],
+            'rows' => ['required', 'array'],
+            'rows.*.sell_register_price' => ['nullable', 'numeric', 'min:0'],
+            'rows.*.sell_renew_price' => ['nullable', 'numeric', 'min:0'],
+            'rows.*.sell_transfer_price' => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        $premiums = \App\Models\TldPremium::whereIn('id', array_keys($data['rows']))
+            ->where('registrar_id', $data['registrar_id'])
+            ->get()
+            ->keyBy('id');
+
+        // Tahap 1: harga jual TIDAK boleh di bawah modal. Kalau ada satu
+        // saja yang melanggar, tidak ada yang disimpan.
+        $errors = [];
+        $labels = ['sell_register_price' => ['cost_register', 'register'], 'sell_renew_price' => ['cost_renew', 'renew'], 'sell_transfer_price' => ['cost_transfer', 'transfer']];
+
+        foreach ($data['rows'] as $id => $row) {
+            $premium = $premiums->get((int) $id);
+
+            if (! $premium) {
+                continue;
+            }
+
+            foreach ($labels as $sellKey => [$costKey, $name]) {
+                $sell = $row[$sellKey] ?? null;
+                $cost = (float) $premium->{$costKey};
+
+                if ($sell !== null && $sell !== '' && $cost > 0 && (float) $sell < $cost) {
+                    $errors[] = "{$premium->label}: jual {$name} Rp " . number_format((float) $sell, 0, ',', '.') . ' di bawah modal Rp ' . number_format($cost, 0, ',', '.');
+                }
+            }
+        }
+
+        if ($errors) {
+            return redirect()->route('admin.tlds.premium-pricing', ['registrar' => $data['registrar_id']])
+                ->withInput()
+                ->with('error', 'Tidak disimpan. ' . implode('; ', $errors));
+        }
+
+        $changed = 0;
+
+        foreach ($data['rows'] as $id => $row) {
+            $premium = $premiums->get((int) $id);
+
+            if (! $premium) {
+                continue;
+            }
+
+            // Beda dari toNumber() yang dipakai halaman TLD Pricing biasa:
+            // kosong di sini TETAP disimpan sebagai null (bukan
+            // dikembalikan ke nilai lama) supaya admin bisa sengaja
+            // mengosongkan harga jual kalau sebuah tingkat premium belum
+            // mau dijual, dan supaya baris yang memang belum pernah
+            // diisi tidak diam-diam berubah jadi Rp 0.
+            $toNullableNumber = fn ($v) => ($v === null || $v === '') ? null : round((float) $v, 2);
+
+            $premium->fill([
+                'sell_register_price' => $toNullableNumber($row['sell_register_price'] ?? null),
+                'sell_renew_price' => $toNullableNumber($row['sell_renew_price'] ?? null),
+                'sell_transfer_price' => $toNullableNumber($row['sell_transfer_price'] ?? null),
+            ]);
+
+            if ($premium->isDirty()) {
+                $premium->save();
+                $changed++;
+            }
+        }
+
+        return redirect()->route('admin.tlds.premium-pricing', ['registrar' => $data['registrar_id']])
+            ->with($changed > 0 ? 'success' : 'info', "{$changed} harga jual domain premium berhasil disimpan.");
+    }
+
+    /**
+     * Ratakan baris /customer-tld-pricings (atau tlds di dalam satu
+     * paket sub-reseller -- bentuknya identik) ke
+     * {extension, currency, is_premium, register, renew, transfer}
+     * berdasarkan durasi 1 tahun, mengikuti pendekatan yang sama
+     * dengan listPrices() di DnamaService untuk harga modal.
+     *
+     * BEDA dengan listPrices(): baris premium TETAP disertakan di sini
+     * (ditandai lewat 'is_premium'), bukan dilewati -- halaman ini
+     * cuma untuk DILIHAT, bukan disinkronkan ke tabel Tld, jadi tidak
+     * ada risiko baris premium menimpa harga reguler seperti saat
+     * sinkronisasi.
+     */
+    private function normalizeTldPricingRows(array $rows): array
+    {
+        $out = [];
+
+        foreach ($rows as $row) {
+            $oneYear = collect($row['pricings'] ?? [])->firstWhere('duration', 1);
+
+            $out[] = [
+                'extension' => $row['tld'] ?? '-',
+                'currency' => $row['currency'] ?? 'IDR',
+                'is_premium' => (bool) ($row['is_premium'] ?? false),
+                'register' => $oneYear['register_price'] ?? null,
+                'renew' => $oneYear['renewal_price'] ?? null,
+                'transfer' => $oneYear['transfer_price'] ?? null,
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Bentuk /sub-reseller-tld-pricings beda dari /customer-tld-pricings
+     * biasa -- dibagi per PAKET (mis. Silver/Gold), tiap paket punya
+     * syarat deposit minimum & batas saldo sendiri, baru di dalamnya
+     * ada daftar TLD dengan bentuk harga yang sama seperti
+     * customer-tld-pricings (ditangani lewat normalizeTldPricingRows()
+     * yang sama).
+     */
+    private function normalizeSubResellerPackages(array $packages): array
+    {
+        $out = [];
+
+        foreach ($packages as $package) {
+            $out[] = [
+                'package_name' => $package['package_name'] ?? '-',
+                'minimum_deposit' => $package['minimum_deposit'] ?? null,
+                'balance_limit' => $package['balance_limit'] ?? null,
+                'description' => $package['description'] ?? null,
+                'tlds' => $this->normalizeTldPricingRows($package['tlds'] ?? []),
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Perbandingan harga antar registrar untuk ekstensi yang sama.
+     * Cuma dihitung untuk ekstensi yang benar-benar tampil di halaman
+     * (bukan seluruh tabel), supaya query-nya tetap ringan.
+     *
+     * Ekstensi yang cuma dijual SATU registrar sengaja tidak masuk hasil
+     * -- barisnya dibiarkan polos, bukan diberi warna "termurah" yang
+     * menyesatkan (tidak ada yang dibandingkan).
+     */
+    private function priceComparison($tlds): array
+    {
+        $visible = $tlds->pluck('extension')->unique()->all();
+
+        if (empty($visible)) {
+            return [];
+        }
+
+        $rows = Tld::whereIn('extension', $visible)
+            ->where('register_price', '>', 0)
+            ->get(['id', 'extension', 'register_price']);
+
+        $compare = [];
+
+        foreach ($rows->groupBy('extension') as $group) {
+            if ($group->count() < 2) {
+                continue;
+            }
+
+            $min = (float) $group->min('register_price');
+            $max = (float) $group->max('register_price');
+
+            foreach ($group as $row) {
+                $price = (float) $row->register_price;
+
+                $compare[$row->id] = [
+                    'rank'  => $price <= $min ? 'cheapest' : ($price >= $max ? 'priciest' : 'middle'),
+                    'count' => $group->count(),
+                    'min'   => $min,
+                ];
+            }
+        }
+
+        return $compare;
+    }
+
+    /**
+     * Aktifkan/nonaktifkan satu TLD.
+     *
+     * EKSKLUSIF PER EKSTENSI: kalau ".com" milik DNAMA diaktifkan,
+     * ".com" milik registrar lain otomatis dinonaktifkan. Alasannya
+     * bukan sekadar kerapian tampilan -- kalau dua registrar sama-sama
+     * aktif untuk ekstensi yang sama, sistem tidak punya cara
+     * menentukan lewat registrar MANA order domain itu harus diproses,
+     * dan harga yang tampil ke klien pun jadi ambigu.
+     */
+    /**
+     * Nonaktifkan TLD lain (registrar berbeda) untuk ekstensi yang sama.
+     * Diekstrak dari status() supaya store()/update() (form tambah/edit
+     * manual) ikut menegakkan aturan yang sama -- sebelumnya cuma
+     * status() yang menjaga ini, jadi admin bisa tidak sengaja
+     * mengaktifkan 2 registrar sekaligus untuk ekstensi yang sama lewat
+     * form biasa.
+     *
+     * @return array<int, string> nama registrar yang ikut dinonaktifkan
+     */
+    private function deactivateSiblingTlds(Tld $tld): array
+    {
+        $siblings = Tld::where('extension', $tld->extension)
+            ->where('id', '!=', $tld->id ?? 0)
+            ->where('is_active', true)
+            ->with('registrar')
+            ->get();
+
+        $deactivated = [];
+
+        foreach ($siblings as $sibling) {
+            $sibling->update(['is_active' => false]);
+            $deactivated[] = $sibling->registrar->name ?? 'Manual';
+        }
+
+        return $deactivated;
+    }
+
+    public function status(Request $request): RedirectResponse|\Illuminate\Http\JsonResponse
+    {
+        $tld = Tld::with('registrar')->findOrFail($request->input('tld_id'));
+
+        // Mengaktifkan TLD tanpa harga jual hampir pasti tidak disengaja.
+        if (! $tld->is_active && (float) $tld->register_price <= 0) {
+            $error = "TLD {$tld->extension} belum punya harga jual. Isi harganya dulu di TLD Pricing sebelum diaktifkan.";
+
+            return $request->ajax()
+                ? response()->json(['success' => false, 'message' => $error], 422)
+                : back()->with('error', $error);
+        }
+
+        $turningOn = ! $tld->is_active;
+        $deactivated = [];
+
+        if ($turningOn) {
+            $deactivated = $this->deactivateSiblingTlds($tld);
+        }
+
+        $tld->update(['is_active' => $turningOn]);
+
+        $message = "TLD {$tld->extension} berhasil " . ($turningOn ? 'diaktifkan' : 'dinonaktifkan') . '.';
+
+        if ($deactivated) {
+            $message .= ' Otomatis dinonaktifkan dari: ' . implode(', ', $deactivated) . '.';
+        }
+
+        if ($request->ajax()) {
+            return response()->json([
+                'success' => true,
+                'message' => $message,
+                'is_active' => $turningOn,
+                'extension' => $tld->extension,
+                'tld_id' => $tld->id,
+                // Dipakai halaman untuk mematikan switch saudara
+                // se-ekstensi tanpa perlu reload.
+                'deactivated_ids' => $turningOn
+                    ? Tld::where('extension', $tld->extension)->where('id', '!=', $tld->id)->pluck('id')->all()
+                    : [],
+            ]);
+        }
+
+        return back()->with('success', $message);
+    }
+
+    /**
+     * Terapkan margin ke banyak TLD sekaligus — meniru panel reseller
+     * (Set prices using Profit Margin).
+     *
+     * Margin bisa diatur terpisah untuk Register / Renew / Transfer,
+     * dinyatakan dalam persen atau rupiah tetap, lalu dibulatkan sesuai
+     * selera. Perhitungan SELALU dari harga modal, bukan dari harga jual
+     * sebelumnya, jadi aman dijalankan berulang kali.
+     */
+    public function bulkMarkup(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'profit_type'      => ['required', 'in:percent,fixed'],
+            'margin_register'  => ['required', 'numeric', 'min:0'],
+            'margin_renew'     => ['nullable', 'numeric', 'min:0'],
+            'margin_transfer'  => ['nullable', 'numeric', 'min:0'],
+
+            'round_mode'       => ['required', 'in:none,multiple,ending'],
+            'round_step'       => ['nullable', 'integer', 'min:1'],
+            'round_tail'       => ['nullable', 'integer', 'min:0'],
+
+            'scope'            => ['required', 'in:all,selected,filtered'],
+            'selected_ids'     => ['nullable', 'string'],
+            'search'           => ['nullable', 'string'],
+            // Dikirim halaman TLD Pricing supaya markup cuma mengenai TLD
+            // milik registrar yang sedang dibuka. Kalau tidak dikirim
+            // (mis. dipanggil dari tempat lain), perilakunya seperti dulu:
+            // berlaku untuk semua registrar.
+            'registrar_scope'  => ['nullable', 'string'],
+
+            'only_empty'       => ['nullable', 'boolean'],
+        ], [
+            'margin_register.required' => 'Margin untuk Register wajib diisi.',
+        ]);
+
+        $type = $data['profit_type'];
+
+        // Renew & Transfer mengikuti Register kalau dikosongkan.
+        $margins = [
+            'register' => (float) $data['margin_register'],
+            'renew'    => $data['margin_renew'] !== null && $data['margin_renew'] !== ''
+                ? (float) $data['margin_renew'] : (float) $data['margin_register'],
+            'transfer' => $data['margin_transfer'] !== null && $data['margin_transfer'] !== ''
+                ? (float) $data['margin_transfer'] : (float) $data['margin_register'],
+        ];
+
+        $query = Tld::query();
+
+        // Dibatasi DULUAN sebelum scope lain -- ini pagar paling penting,
+        // supaya markup yang dijalankan dari halaman satu registrar tidak
+        // pernah menyentuh harga registrar lain.
+        $registrarScope = $data['registrar_scope'] ?? null;
+
+        if ($registrarScope === 'none') {
+            $query->whereNull('registrar_id');
+        } elseif ($registrarScope !== null && $registrarScope !== '') {
+            $query->where('registrar_id', (int) $registrarScope);
+        }
+
+        if ($data['scope'] === 'selected') {
+            $ids = array_filter(array_map('intval', explode(',', (string) ($data['selected_ids'] ?? ''))));
+
+            if (empty($ids)) {
+                return back()->with('error', 'Belum ada TLD yang dicentang di tabel.');
+            }
+
+            $query->whereIn('id', $ids);
+        } elseif ($data['scope'] === 'filtered' && ! empty($data['search'])) {
+            $query->where('extension', 'like', '%' . $data['search'] . '%');
+        }
+
+        if ($request->boolean('only_empty')) {
+            $query->where(fn ($q) => $q->whereNull('register_price')->orWhere('register_price', '<=', 0));
+        }
+
+        $updated = 0;
+        $skipped = 0;
+
+        foreach ($query->get() as $tld) {
+            if ((float) $tld->cost_register <= 0) {
+                $skipped++;
+                continue;
+            }
+
+            $costs = [
+                'register' => (float) $tld->cost_register,
+                'renew'    => (float) $tld->cost_renew ?: (float) $tld->cost_register,
+                'transfer' => (float) $tld->cost_transfer ?: (float) $tld->cost_register,
+            ];
+
+            $prices = [];
+
+            foreach ($costs as $field => $cost) {
+                $price = $type === 'percent'
+                    ? $cost * (1 + $margins[$field] / 100)
+                    : $cost + $margins[$field];
+
+                $prices[$field] = $this->roundPrice(
+                    $price,
+                    $data['round_mode'],
+                    (int) ($data['round_step'] ?? 1000),
+                    (int) ($data['round_tail'] ?? 0)
+                );
+            }
+
+            // Harga JUAL per tahun (2-10 thn) ikut dihitung dari harga
+            // MODAL per tahun yang disinkron dari registrar
+            // (cost_year_prices) -- pakai margin & pembulatan yang sama.
+            //
+            // Sebelumnya markup cuma menyentuh harga 1 tahun, jadi kolom
+            // "Harga per Tahun" tetap kosong/"otomatis" walau markup
+            // sudah dijalankan. Padahal harga otomatis (harga 1thn x N)
+            // sering meleset jauh dari harga modal sebenarnya: registrar
+            // biasanya TIDAK mengenakan kelipatan lurus untuk durasi
+            // panjang, jadi tanpa ini margin durasi panjang bisa jauh
+            // lebih tipis (atau malah rugi) tanpa ketahuan.
+            $yearPrices = $this->markupYearPrices(
+                $tld->cost_year_prices,
+                $type,
+                $margins['register'],
+                $data
+            );
+
+            $yearRenewPrices = $this->markupYearPrices(
+                $tld->cost_year_renew_prices,
+                $type,
+                $margins['renew'],
+                $data
+            );
+
+            $update = [
+                'register_price' => $prices['register'],
+                'renew_price'    => $prices['renew'],
+                'transfer_price' => $prices['transfer'],
+                // is_active SENGAJA tidak disentuh di sini. Aktivasi
+                // sekarang eksklusif per ekstensi (lihat status()), jadi
+                // mengaktifkan massal lewat markup bisa diam-diam
+                // menggeser registrar yang sudah sengaja dipilih admin
+                // untuk ekstensi yang sama.
+            ];
+
+            // Cuma ditimpa kalau memang ada modal per-tahun untuk dihitung
+            // -- kalau registrar tidak menyediakannya, harga per tahun
+            // yang sudah diisi manual admin dibiarkan apa adanya.
+            if ($yearPrices) {
+                $update['year_prices'] = $yearPrices;
+            }
+
+            if ($yearRenewPrices) {
+                $update['year_renew_prices'] = $yearRenewPrices;
+            }
+
+            $tld->update($update);
+
+            $updated++;
+        }
+
+        if ($updated === 0 && $skipped > 0) {
+            return back()->with('error',
+                "Tidak ada harga yang berubah. Semua {$skipped} TLD belum punya harga modal, " .
+                'jadi margin tidak bisa dihitung. Isi kolom Modal dulu, atau pakai Impor Harga.'
+            );
+        }
+
+        if ($updated === 0) {
+            return back()->with('error', 'Tidak ada TLD yang cocok dengan kriteria yang dipilih.');
+        }
+
+        $label = $type === 'percent'
+            ? "Margin {$margins['register']}%"
+            : 'Margin Rp ' . number_format($margins['register'], 0, ',', '.');
+
+        $msg = "{$label} diterapkan ke {$updated} TLD.";
+        $msg .= $skipped > 0 ? " {$skipped} TLD dilewati karena belum punya harga modal." : '';
+
+        return back()->with('success', $msg);
+    }
+
+    /**
+     * Halaman terpisah khusus ID Protection -- dulu numpuk di TLD
+     * Pricing, dipisah supaya tabel TLD Pricing tidak makin padat.
+     * Tiga tingkat harga (dari yang paling spesifik):
+     *   1. Per-TLD (kalau diisi admin)
+     *   2. Per-registrar (kalau diisi admin)
+     *   3. Global/default (fallback terakhir)
+     */
+    public function privacy(Request $request): View
+    {
+        $registrars = Registrar::orderBy('name')->get();
+
+        $tlds = Tld::with('registrar')
+            ->when($request->search, fn ($q) => $q->where('extension', 'like', "%{$request->search}%"))
+            ->when($request->registrar === 'none', fn ($q) => $q->whereNull('registrar_id'))
+            ->when($request->registrar && $request->registrar !== 'none', fn ($q) => $q->where('registrar_id', $request->registrar))
+            ->orderBy('extension')
+            ->paginate(min((int) $request->input('per_page', 50), 200))
+            ->withQueryString();
+
+        return view('admin.tlds.privacy', compact('registrars', 'tlds'));
+    }
+
+    public function privacyBootstrap(Request $request): View
+    {
+        return $this->privacy($request);
+    }
+
+    /**
+     * Simpan harga per-registrar -- satu form untuk semua baris
+     * sekaligus, sama pola dengan tabel TLD Pricing.
+     */
+    public function updatePrivacyRegistrars(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'registrars'                       => ['required', 'array'],
+            'registrars.*.whois_privacy_price'  => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        $changed = 0;
+
+        foreach ($data['registrars'] as $id => $row) {
+            $registrar = Registrar::find($id);
+
+            if (! $registrar) {
+                continue;
+            }
+
+            $price = $row['whois_privacy_price'] ?? null;
+            $registrar->whois_privacy_price = ($price === null || $price === '') ? null : round((float) $price, 2);
+
+            if ($registrar->isDirty()) {
+                $registrar->save();
+                $changed++;
+            }
+        }
+
+        return back()->with('success', "{$changed} registrar berhasil diperbarui.");
+    }
+
+    /**
+     * Simpan eligibilitas + harga per-TLD -- terpisah dari bulkUpdate()
+     * TLD Pricing supaya menyimpan harga register/renew/transfer TIDAK
+     * ikut menimpa status ID Protection TLD yang tidak sedang ditampilkan
+     * di halaman itu, dan sebaliknya.
+     */
+    public function updatePrivacyTlds(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'rows'                        => ['required', 'array'],
+            'rows.*.whois_privacy_price'  => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        $eligibleIds = array_map('intval', (array) $request->input('eligible', []));
+        $changed = 0;
+
+        $tlds = Tld::whereIn('id', array_keys($data['rows']))->get()->keyBy('id');
+
+        foreach ($data['rows'] as $id => $row) {
+            $tld = $tlds->get((int) $id);
+
+            if (! $tld) {
+                continue;
+            }
+
+            $tld->whois_privacy_eligible = in_array((int) $id, $eligibleIds, true);
+
+            $price = $row['whois_privacy_price'] ?? null;
+            $tld->whois_privacy_price = ($price === null || $price === '') ? null : round((float) $price, 2);
+
+            if ($tld->isDirty()) {
+                $tld->save();
+                $changed++;
+            }
+        }
+
+        return back()->with('success', "{$changed} TLD berhasil diperbarui.");
+    }
+
+    /**
+     * Hitung harga JUAL per tahun (2-10 thn) dari harga MODAL per tahun
+     * yang disinkron dari registrar, memakai margin & pembulatan yang
+     * sama dengan harga 1 tahun.
+     *
+     * Dipisah jadi method sendiri (bukan inline di bulkMarkup) supaya
+     * alurnya lugas -- versi sebelumnya memakai referensi di dalam array
+     * literal (&$target), yang sulit dipastikan benar sekilas baca.
+     *
+     * @return array<string, float>  kosong kalau registrar tidak
+     *                               menyediakan harga modal per tahun
+     */
+    private function markupYearPrices($costYears, string $type, float $margin, array $data): array
+    {
+        if (! is_array($costYears) || empty($costYears)) {
+            return [];
+        }
+
+        $result = [];
+
+        foreach ($costYears as $year => $costYear) {
+            $costYear = (float) $costYear;
+
+            if ($costYear <= 0) {
+                continue;
+            }
+
+            $price = $type === 'percent'
+                ? $costYear * (1 + $margin / 100)
+                : $costYear + $margin;
+
+            $result[(string) $year] = $this->roundPrice(
+                $price,
+                $data['round_mode'] ?? 'multiple',
+                (int) ($data['round_step'] ?? 1000),
+                (int) ($data['round_tail'] ?? 0)
+            );
+        }
+
+        return $result;
+    }
+
+    /**
+     * Bulatkan harga sesuai mode yang dipilih.
+     *
+     * - none     : biarkan apa adanya
+     * - multiple : bulatkan ke atas ke kelipatan tertentu (mis. 1.000)
+     * - ending   : paksa digit akhir tertentu (mis. selalu berakhir 9.000)
+     */
+    private function roundPrice(float $price, string $mode, int $step, int $tail): float
+    {
+        if ($mode === 'multiple' && $step > 0) {
+            return ceil($price / $step) * $step;
+        }
+
+        if ($mode === 'ending' && $step > 0) {
+            $base = floor($price / $step) * $step + $tail;
+
+            // Kalau hasilnya jadi lebih murah dari harga aslinya, naikkan
+            // satu kelipatan supaya margin tidak berkurang.
+            if ($base < $price) {
+                $base += $step;
+            }
+
+            return $base;
+        }
+
+        return round($price, 2);
+    }
+
+    /**
+     * Tarik harga modal langsung dari registrar, lalu tampilkan sebagai
+     * tabel pratinjau. Tidak ada copy-paste dan belum ada yang disimpan.
+     */
+    public function syncPreview(Request $request): View|RedirectResponse
+    {
+        $data = $request->validate([
+            'registrar_id' => ['nullable', 'exists:registrars,id'],
+            'markup'       => ['required', 'numeric', 'min:0', 'max:1000'],
+            'round_to'     => ['nullable', 'integer', 'min:0'],
+            'only_sellable' => ['nullable', 'boolean'],
+        ]);
+
+        $registrar = ! empty($data['registrar_id'])
+            ? Registrar::find($data['registrar_id'])
+            : Registrar::where('is_active', true)->orderByDesc('is_default')->first();
+
+        if (! $registrar) {
+            return back()->with('error', 'Belum ada registrar aktif. Tambahkan dulu di tab Registrar.');
+        }
+
+        $service = DomainRegistrarFactory::make($registrar);
+
+        if (! method_exists($service, 'listPrices')) {
+            return back()->with('error', "Provider {$registrar->provider} belum mendukung pengambilan harga otomatis.");
+        }
+
+        $result = $service->listPrices();
+
+        if (! $result['success']) {
+            return back()->with('error', 'Gagal mengambil harga: ' . $result['message']);
+        }
+
+        $markup  = (float) $data['markup'];
+        $roundTo = (int) ($data['round_to'] ?? 1000);
+        $onlySellable = $request->boolean('only_sellable');
+
+        $existing = Tld::whereIn('extension', array_keys($result['prices']))->get()->keyBy('extension');
+
+        $rows = [];
+
+        foreach ($result['prices'] as $ext => $price) {
+            // Lewati TLD yang belum diaktifkan untuk dijual di panel registrar.
+            if ($onlySellable && isset($price['sellable']) && ! $price['sellable']) {
+                continue;
+            }
+
+            $cost = (float) $price['register'];
+
+            if ($cost <= 0) {
+                continue;
+            }
+
+            $selling = $cost * (1 + $markup / 100);
+
+            if ($roundTo > 0) {
+                $selling = ceil($selling / $roundTo) * $roundTo;
+            }
+
+            $tld = $existing->get($ext);
+
+            $rows[] = [
+                'extension' => $ext,
+                'cost'      => $cost,
+                'selling'   => $selling,
+                'exists'    => (bool) $tld,
+                'tld_id'    => $tld?->id,
+                // TLD yang sudah aktif tetap dicentang; yang baru mengikuti
+                // status "Sell" di panel registrar.
+                'active'    => (bool) ($tld?->is_active ?: ($price['sellable'] ?? false)),
+                'old_cost'  => (float) ($tld?->cost_register ?? 0),
+                'old_price' => (float) ($tld?->register_price ?? 0),
+            ];
+        }
+
+        if (empty($rows)) {
+            return back()->with('error', 'Tidak ada harga yang bisa ditampilkan dari registrar ini.');
+        }
+
+        usort($rows, fn ($a, $b) => strcmp($a['extension'], $b['extension']));
+
+        return view('admin.tlds.import-preview', [
+            'rows'      => $rows,
+            'markup'    => $markup,
+            'roundTo'   => $roundTo,
+            'source'    => $registrar->name,
+            'registrarId' => $registrar->id,
+        ]);
+    }
+
+    /**
+     * Langkah 1 impor: baca teks yang ditempel, lalu tampilkan sebagai
+     * tabel pratinjau. BELUM ada yang disimpan di sini — supaya kamu bisa
+     * memeriksa dan menyesuaikan tiap baris sebelum benar-benar diterapkan.
+     */
+    public function importPreview(Request $request): View|RedirectResponse
+    {
+        $data = $request->validate([
+            'price_text'   => ['required', 'string'],
+            'multiplier'   => ['required', 'numeric', 'min:1'],
+            // Panel "Manage Prices" Liqu.id menampilkan dua angka per baris:
+            // angka ke-1 = harga jual ke customer, angka ke-2 = harga modal
+            // reseller. Yang dipakai untuk markup adalah yang ke-2.
+            'price_column' => ['required', 'integer', 'min:1', 'max:3'],
+            'markup'       => ['required', 'numeric', 'min:0', 'max:1000'],
+            'round_to'     => ['nullable', 'integer', 'min:0'],
+        ]);
+
+        $parsed = $this->parsePriceText(
+            $data['price_text'],
+            (int) $data['price_column'],
+            (float) $data['multiplier']
+        );
+
+        if (empty($parsed)) {
+            return back()->with('error',
+                'Tidak ada harga yang terbaca. Pastikan tiap baris berisi ekstensi lalu angkanya, contoh: ".COM Domain Names  170.33 163.44  4.22 %"'
+            );
+        }
+
+        $markup  = (float) $data['markup'];
+        $roundTo = (int) ($data['round_to'] ?? 1000);
+
+        $existing = Tld::whereIn('extension', array_keys($parsed))->get()->keyBy('extension');
+
+        $rows = [];
+
+        foreach ($parsed as $ext => $cost) {
+            $tld = $existing->get($ext);
+
+            $selling = $cost * (1 + $markup / 100);
+
+            if ($roundTo > 0) {
+                $selling = ceil($selling / $roundTo) * $roundTo;
+            }
+
+            $rows[] = [
+                'extension' => $ext,
+                'cost'      => $cost,
+                'selling'   => $selling,
+                'exists'    => (bool) $tld,
+                'tld_id'    => $tld?->id,
+                // TLD yang sudah aktif tetap dicentang; yang baru dibiarkan
+                // mati supaya tidak langsung tampil sebelum dicek.
+                'active'    => (bool) ($tld?->is_active),
+                'old_cost'  => (float) ($tld?->cost_register ?? 0),
+                'old_price' => (float) ($tld?->register_price ?? 0),
+            ];
+        }
+
+        return view('admin.tlds.import-preview', [
+            'rows'    => $rows,
+            'markup'  => $markup,
+            'roundTo' => $roundTo,
+            'source'  => null,
+            // Impor dari teks tempel tidak terikat registrar mana pun --
+            // hasilnya masuk sebagai TLD "Manual (Tidak Ditentukan)".
+            'registrarId' => null,
+        ]);
+    }
+
+    /**
+     * Langkah 2 impor: simpan baris-baris yang dicentang dari pratinjau.
+     */
+    public function importApply(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'rows'                  => ['required', 'array'],
+            'rows.*.extension'      => ['required', 'string', 'max:30'],
+            'rows.*.cost'           => ['nullable', 'numeric', 'min:0'],
+            'rows.*.selling'        => ['nullable', 'numeric', 'min:0'],
+            'include'               => ['nullable', 'array'],
+            'registrar_id'          => ['nullable', 'integer', 'exists:registrars,id'],
+        ]);
+
+        $registrarId = $data['registrar_id'] ?? null;
+
+        $include = array_map('strval', (array) $request->input('include', []));
+        $activate = array_map('strval', (array) $request->input('active', []));
+
+        $created = 0;
+        $updated = 0;
+        $skipped = 0;
+
+        foreach ($data['rows'] as $key => $row) {
+            // Baris yang tidak dicentang sengaja dilewati.
+            if (! in_array((string) $key, $include, true)) {
+                $skipped++;
+                continue;
+            }
+
+            $ext = '.' . ltrim(strtolower(trim($row['extension'])), '.');
+            $cost = round((float) ($row['cost'] ?? 0), 2);
+            $selling = round((float) ($row['selling'] ?? 0), 2);
+            $isActive = in_array((string) $key, $activate, true) && $selling > 0;
+
+            // Aktivasi EKSKLUSIF per ekstensi -- sama seperti aturan di
+            // status(). Tanpa ini, impor bisa mengaktifkan ".com" milik
+            // registrar ini sementara ".com" milik registrar lain juga
+            // masih aktif, dan sistem tidak punya cara menentukan lewat
+            // registrar mana order harus diproses.
+            if ($isActive) {
+                Tld::where('extension', $ext)
+                    ->when($registrarId, fn ($q) => $q->where('registrar_id', '!=', $registrarId))
+                    ->when(! $registrarId, fn ($q) => $q->whereNotNull('registrar_id'))
+                    ->update(['is_active' => false]);
+            }
+
+            // Dicocokkan per (extension, registrar) -- sejak satu ekstensi
+            // boleh dimiliki beberapa registrar, mencari lewat extension
+            // saja bisa salah menimpa baris milik registrar LAIN.
+            $tld = Tld::where('extension', $ext)
+                ->where('registrar_id', $registrarId)
+                ->first();
+
+            // Baris manual (belum punya registrar) di-claim kalau ada,
+            // supaya tidak dobel percuma.
+            if (! $tld && $registrarId) {
+                $tld = Tld::where('extension', $ext)->whereNull('registrar_id')->first();
+            }
+
+            $values = [
+                'cost_register'  => $cost,
+                'cost_renew'     => $cost,
+                'cost_transfer'  => $cost,
+                'cost_currency'  => 'IDR',
+                'cost_synced_at' => $cost > 0 ? now() : null,
+                'register_price' => $selling,
+                'renew_price'    => $selling,
+                'transfer_price' => $selling,
+                'is_active'      => $isActive,
+            ];
+
+            if ($tld) {
+                $values['registrar_id'] = $registrarId;
+                $tld->update($values);
+                $updated++;
+            } else {
+                Tld::create(array_merge([
+                    'extension' => $ext,
+                    'registrar_id' => $registrarId,
+                    'min_years' => 1,
+                    'max_years' => 10,
+                ], $values));
+                $created++;
+            }
+        }
+
+        $backTo = route('admin.tlds.pricing', $registrarId ? ['registrar' => $registrarId] : []);
+
+        if ($created === 0 && $updated === 0) {
+            return redirect()->to($backTo)
+                ->with('error', 'Tidak ada baris yang dicentang, jadi tidak ada yang disimpan.');
+        }
+
+        $msg = "Impor selesai — {$updated} TLD diperbarui";
+        $msg .= $created > 0 ? ", {$created} TLD baru dibuat." : '.';
+        $msg .= $skipped > 0 ? " {$skipped} baris dilewati." : '';
+
+        return redirect()->to($backTo)->with('success', $msg);
+    }
+
+    /**
+     * Baca teks daftar harga jadi map [ekstensi => harga modal].
+     *
+     * Menerima pemisah tab, koma, titik koma, atau spasi. Teks seperti
+     * "Domain Names", "IDR", dan "%" diabaikan karena bukan angka.
+     */
+    private function parsePriceText(string $text, int $column, float $multiplier): array
+    {
+        $result = [];
+
+        foreach (preg_split('/\R/', $text) as $line) {
+            $line = trim($line);
+
+            if ($line === '') {
+                continue;
+            }
+
+            $parts = preg_split('/\t|,|;|\s{2,}|\s+/', $line, -1, PREG_SPLIT_NO_EMPTY);
+
+            if (count($parts) < 2) {
+                continue;
+            }
+
+            $ext = '.' . ltrim(strtolower(trim($parts[0])), '.');
+
+            $numbers = [];
+
+            foreach (array_slice($parts, 1) as $part) {
+                $clean = str_replace(',', '', trim($part));
+
+                if (is_numeric($clean) && (float) $clean > 0) {
+                    $numbers[] = (float) $clean;
+                }
+            }
+
+            $price = $numbers[$column - 1] ?? ($numbers[0] ?? null);
+
+            if ($price === null || $price <= 0) {
+                continue;
+            }
+
+            $result[$ext] = round($price * $multiplier, 2);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Simpan perubahan harga yang diketik langsung di tabel.
+     *
+     * Jauh lebih praktis daripada membuka form edit satu per satu, dan
+     * hanya baris yang benar-benar berubah yang disentuh database.
+     */
+    public function bulkUpdate(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'rows'                    => ['required', 'array'],
+            'rows.*.search_group'     => ['nullable', 'string', 'max:50'],
+        ]);
+
+        $searchIds = array_map('intval', (array) $request->input('in_search', []));
+        $homeIds   = array_map('intval', (array) $request->input('on_home', []));
+        $changed = 0;
+        $blocked = [];
+
+        $tlds = Tld::whereIn('id', array_keys($data['rows']))->get()->keyBy('id');
+
+        foreach ($data['rows'] as $id => $row) {
+            $tld = $tlds->get((int) $id);
+
+            if (! $tld) {
+                continue;
+            }
+
+            $register = (float) $tld->register_price;
+
+            // PENTING: is_active TIDAK lagi diurus di sini. Switch "Aktif"
+            // di halaman Status TLD sekarang berjalan lewat AJAX ke
+            // status(), karena aktivasi harus eksklusif per ekstensi
+            // (mengaktifkan satu registrar mematikan yang lain). Kalau
+            // is_active tetap ikut disimpan dari form ini, tombol Simpan
+            // akan menonaktifkan SEMUA TLD -- form-nya sudah tidak lagi
+            // mengirim input active[].
+            //
+            // Harga juga tidak diurus di sini lagi (pindah ke halaman
+            // TLD Pricing) -- yang tersisa cuma Tampil di Web & Grup.
+            $values = [
+                // TLD tanpa harga jual tidak boleh tampil di halaman publik,
+                // apa pun centangnya — kalau tidak, pengunjung melihat
+                // domain seharga Rp 0.
+                'show_in_search' => in_array((int) $id, $searchIds, true) && $register > 0,
+                'show_on_home'   => in_array((int) $id, $homeIds, true) && $register > 0,
+                'search_group'   => $row['search_group'] ?? $tld->search_group,
+            ];
+
+            if (in_array((int) $id, $searchIds, true) && $register <= 0) {
+                $blocked[] = $tld->extension;
+            }
+
+            $tld->fill($values);
+
+            if ($tld->isDirty()) {
+                $tld->save();
+                $changed++;
+            }
+        }
+
+        if ($changed === 0) {
+            $msg = 'Tidak ada nilai yang berubah, jadi tidak ada yang perlu disimpan.';
+
+            return $request->wantsJson()
+                ? response()->json(['ok' => true, 'changed' => 0, 'message' => $msg])
+                : back()->with('info', $msg);
+        }
+
+        $msg = "{$changed} TLD berhasil diperbarui.";
+
+        if ($blocked) {
+            $count = count($blocked);
+            $sample = implode(', ', array_slice($blocked, 0, 5));
+            $msg .= " {$count} TLD tidak jadi ditampilkan di web karena harga register-nya masih 0 ({$sample}" . ($count > 5 ? ', …' : '') . ').';
+        }
+
+        if ($request->wantsJson()) {
+            return response()->json(['ok' => true, 'changed' => $changed, 'message' => $msg]);
+        }
+
+        return back()->with($blocked ? 'error' : 'success', $msg);
+    }
+
+    /**
+     * Ubah input jadi angka; kosong berarti pakai nilai lama.
+     */
+    private function toNumber(mixed $value, mixed $fallback): float
+    {
+        if ($value === null || $value === '') {
+            return (float) $fallback;
+        }
+
+        return round((float) $value, 2);
+    }
+
+    public function create(): View
+    {
+        $registrars = Registrar::where('is_active', true)->orderBy('name')->get();
+
+        return view('admin.tlds.form', ['tld' => new Tld(), 'registrars' => $registrars]);
+    }
+
+    public function store(Request $request): RedirectResponse
+    {
+        $data = $this->validated($request);
+        $data['is_active'] = $request->boolean('is_active', true);
+
+        $tld = Tld::create($data);
+
+        $deactivated = $data['is_active'] ? $this->deactivateSiblingTlds($tld) : [];
+
+        $message = 'TLD berhasil ditambahkan.';
+        if ($deactivated) {
+            $message .= ' Otomatis dinonaktifkan dari: ' . implode(', ', $deactivated) . '.';
+        }
+
+        return redirect()->route('admin.tlds.index')->with('success', $message);
+    }
+
+    public function edit(Tld $tld): View
+    {
+        $registrars = Registrar::where('is_active', true)->orderBy('name')->get();
+
+        return view('admin.tlds.form', ['tld' => $tld, 'registrars' => $registrars]);
+    }
+
+    public function update(Request $request, Tld $tld): RedirectResponse
+    {
+        $data = $this->validated($request);
+        $data['is_active'] = $request->boolean('is_active');
+
+        $tld->update($data);
+
+        $deactivated = $tld->is_active ? $this->deactivateSiblingTlds($tld) : [];
+
+        $message = 'TLD berhasil diperbarui.';
+        if ($deactivated) {
+            $message .= ' Otomatis dinonaktifkan dari: ' . implode(', ', $deactivated) . '.';
+        }
+
+        return redirect()->route('admin.tlds.index')->with('success', $message);
+    }
+
+    public function destroy(Tld $tld, DeletionGuard $guard): RedirectResponse
+    {
+        $reason = $guard->deleteLocked($tld, fn ($t) => $guard->forTld($t));
+
+        if ($reason) {
+            return back()->with('error', $reason);
+        }
+
+        $guard->audit('domain', "TLD {$tld->extension} dihapus");
+
+        return redirect()->route('admin.tlds.index')->with('success', 'TLD berhasil dihapus.');
+    }
+
+    private function validated(Request $request): array
+    {
+        $data = $request->validate([
+            'extension'      => ['required', 'string', 'max:30', Rule::unique('tlds', 'extension')->where(fn ($q) => $q->where('registrar_id', $request->input('registrar_id')))->ignore($request->route('tld')?->id)],
+            'registrar_id'   => ['nullable', 'exists:registrars,id'],
+            'register_price' => ['required', 'numeric', 'min:0'],
+            'renew_price'    => ['required', 'numeric', 'min:0'],
+            'transfer_price' => ['required', 'numeric', 'min:0'],
+            'min_years'      => ['required', 'integer', 'min:1', 'max:10'],
+            'max_years'      => ['required', 'integer', 'min:1', 'max:10'],
+            'is_active'      => ['nullable', 'boolean'],
+            'year_prices'    => ['nullable', 'array'],
+            'year_prices.*'  => ['nullable', 'numeric', 'min:0'],
+            'year_renew_prices'   => ['nullable', 'array'],
+            'year_renew_prices.*' => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        // Buang durasi yang dikosongkan supaya tidak tersimpan sebagai 0 —
+        // nilai kosong berarti "pakai perhitungan otomatis".
+        foreach (['year_prices', 'year_renew_prices'] as $field) {
+            $data[$field] = collect($data[$field] ?? [])
+                ->filter(fn ($v) => $v !== null && $v !== '' && (float) $v > 0)
+                ->map(fn ($v) => (float) $v)
+                ->all() ?: null;
+        }
+
+        return $data;
+    }
 }

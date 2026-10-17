@@ -1,0 +1,330 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\ChatConversation;
+use App\Models\ChatMessage;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\View\View;
+
+class ChatController extends Controller
+{
+
+    public function indexBootstrap(Request $request): View
+    {
+        return view('admin.chats.index', $this->indexData($request) + ['chat' => null]);
+    }
+
+    private function indexData(Request $request, ?ChatConversation $current = null): array
+    {
+        // Saat membuka percakapan yang sudah ditutup, daftar kiri ikut tab "Ditutup".
+        $tab = $request->query('status') ?? ($current?->status === 'closed' ? 'closed' : 'open');
+
+        $conversations = ChatConversation::query()
+            ->inLiveChat()
+            ->with(['client', 'assignedAdmin', 'latestMessage'])
+            ->when($tab === 'closed', fn ($q) => $q->where('status', 'closed'))
+            ->when($tab !== 'closed', fn ($q) => $q->where('status', 'open'))
+            ->when($request->query('search'), fn ($q) => $q->where(function ($w) use ($request) {
+                $term = '%' . $request->query('search') . '%';
+                $w->where('name', 'like', $term)
+                    ->orWhere('email', 'like', $term)
+                    ->orWhere('phone', 'like', $term)
+                    ->orWhereHas('client', fn ($client) => $client
+                        ->where('name', 'like', $term)
+                        ->orWhere('email', 'like', $term));
+            }))
+            ->orderByDesc('unread_for_admin')
+            ->orderByDesc('last_message_at')
+            ->paginate(30)
+            ->withQueryString();
+
+        $counts = [
+            'open' => ChatConversation::inLiveChat()->open()->count(),
+            'unread' => ChatConversation::inLiveChat()->where('unread_for_admin', '>', 0)->count(),
+            'unassigned' => ChatConversation::waitingUnassigned()->count(),
+            'closed' => ChatConversation::inLiveChat()->where('status', 'closed')->count(),
+        ];
+
+        return compact('conversations', 'counts', 'tab');
+    }
+
+    public function showBootstrap(Request $request, ChatConversation $chat): View
+    {
+        $this->markOpened($chat);
+
+        return view('admin.chats.show', $this->indexData($request, $chat) + ['chat' => $chat]);
+    }
+
+    private function markOpened(ChatConversation $chat): void
+    {
+        $chat->load(['client', 'messages.admin', 'assignedAdmin']);
+
+        $admin = Auth::guard('admin')->user();
+
+        // Percakapan yang belum dipegang siapa pun otomatis "diambil"
+        // begitu seorang staf membukanya -- supaya tidak ada dua staf
+        // balas percakapan yang sama tanpa sadar, dan setiap chat punya
+        // penanggung jawab yang jelas.
+        if (! $chat->assigned_admin_id) {
+            $chat->update(['assigned_admin_id' => $admin->id, 'assigned_at' => now()]);
+        }
+
+        // Dibuka admin = pesan pengunjung sudah dibaca.
+        $chat->update(['unread_for_admin' => 0]);
+    }
+
+    /**
+     * Staf lain (bukan yang sedang memegang) bisa ambil alih manual --
+     * mis. staf sebelumnya sedang sibuk atau offline.
+     */
+    public function claim(ChatConversation $chat): RedirectResponse
+    {
+        $chat->update(['assigned_admin_id' => Auth::guard('admin')->id(), 'assigned_at' => now()]);
+
+        return back()->with('success', 'Percakapan ini sekarang jadi tanggung jawab Anda.');
+    }
+
+    /**
+     * Ambil pesan baru (dipakai polling di halaman detail).
+     */
+    public function poll(Request $request, ChatConversation $chat): JsonResponse
+    {
+        $afterId = (int) $request->input('after', 0);
+
+        $messages = $chat->messages()
+            ->with('admin')
+            ->where('id', '>', $afterId)
+            ->orderBy('id')
+            ->get();
+
+        if ($messages->where('sender', 'user')->isNotEmpty()) {
+            $chat->update(['unread_for_admin' => 0]);
+        }
+
+        return response()->json([
+            'messages' => $messages->map->toWidgetArray()->values(),
+            'status' => $chat->status,
+        ]);
+    }
+
+    public function reply(Request $request, ChatConversation $chat): RedirectResponse|JsonResponse
+    {
+        $admin = Auth::guard('admin')->user();
+
+        // Klaim sekarang benar-benar DITEGAKKAN, bukan sekadar label --
+        // kalau percakapan ini sudah dipegang staf LAIN, staf yang
+        // sedang login tidak bisa ikut membalas sampai dia sendiri
+        // yang mengambil alih lewat tombol "Ambil Alih".
+        if ($chat->assigned_admin_id && $chat->assigned_admin_id !== $admin->id) {
+            $message = 'Percakapan ini sedang dipegang ' . ($chat->assignedAdmin?->name ?: 'staf lain') . '. Ambil alih dulu kalau ingin membalas.';
+
+            return $request->wantsJson()
+                ? response()->json(['ok' => false, 'message' => $message], 409)
+                : back()->with('error', $message);
+        }
+
+        $data = $request->validate([
+            'message' => ['nullable', 'string', 'max:2000'],
+            'attachment' => ['nullable', 'file', 'max:5120', 'mimes:jpg,jpeg,png,webp,pdf'],
+        ]);
+
+        if (blank($data['message'] ?? null) && ! $request->hasFile('attachment')) {
+            return $request->wantsJson()
+                ? response()->json(['ok' => false, 'message' => 'Pesan kosong.'], 422)
+                : back()->with('error', 'Tulis pesan atau lampirkan berkas.');
+        }
+
+        $message = new ChatMessage([
+            'sender' => 'admin',
+            'admin_id' => $admin->id,
+            'message' => $data['message'] ?? null,
+        ]);
+
+        if ($request->hasFile('attachment')) {
+            $file = $request->file('attachment');
+            $message->attachment_path = $file->store('chat', 'local');
+            $message->attachment_name = $file->getClientOriginalName();
+            $message->attachment_mime = $file->getMimeType();
+        }
+
+        $chat->messages()->save($message);
+        $chat->increment('unread_for_user');
+        $chat->update(['last_message_at' => now(), 'status' => 'open']);
+
+        // Untuk percakapan WhatsApp, balasan admin harus benar-benar
+        // dikirim ke WhatsApp klien -- kalau cuma tersimpan di database
+        // tanpa ini, klien tidak akan pernah melihatnya sama sekali
+        // (mereka tidak sedang membuka widget web).
+        if ($chat->channel === 'whatsapp' && $chat->phone && filled($message->message)) {
+            $sent = app(\App\Notifications\Channels\WhatsAppChannel::class)->dispatch($chat->phone, $message->message);
+
+            if (! $sent) {
+                \Illuminate\Support\Facades\Log::warning('Balasan admin gagal dikirim ke WhatsApp klien.', ['conversation_id' => $chat->id]);
+            }
+        }
+
+        // Percakapan dari email: balasan staf dikirim ke alamat email mereka
+        // (token [CHAT-id] di subjek membuat balasan mereka kembali ke sini).
+        if ($chat->channel === 'email') {
+            if (! \App\Services\Mail\ChatMailer::sendReply($chat, $message)) {
+                \Illuminate\Support\Facades\Log::warning('Balasan admin gagal dikirim lewat email.', ['conversation_id' => $chat->id]);
+
+                $emailFailed = true;
+            }
+        }
+
+        // Setelah membalas, kalau staf ini tidak punya percakapan lain
+        // yang masih menunggu balasan, otomatis berikan percakapan
+        // TERLAMA yang belum dipegang siapa pun -- supaya staf tidak
+        // perlu bolak-balik cek daftar manual, dan tidak ada klien yang
+        // ketahanan lama karena percakapannya tidak "kelihatan" siapa pun.
+        //
+        // Dikunci (lockForUpdate) di dalam transaksi supaya kalau dua
+        // staf sama-sama membalas dalam waktu bersamaan, mereka TIDAK
+        // sama-sama dapat percakapan berikutnya yang sama.
+        $autoAssigned = null;
+
+        $hasOtherWaiting = ChatConversation::where('assigned_admin_id', $admin->id)
+            ->where('id', '!=', $chat->id)
+            ->where('unread_for_admin', '>', 0)
+            ->exists();
+
+        if (! $hasOtherWaiting) {
+            $autoAssigned = \Illuminate\Support\Facades\DB::transaction(function () use ($admin) {
+                $next = ChatConversation::waitingUnassigned()
+                    ->oldest('last_message_at')
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($next) {
+                    $next->update(['assigned_admin_id' => $admin->id, 'assigned_at' => now()]);
+                }
+
+                return $next;
+            });
+        }
+
+        if ($request->wantsJson()) {
+            return response()->json([
+                'ok' => true,
+                'email_failed' => $emailFailed ?? false,
+                'message' => $message->load('admin')->toWidgetArray(),
+                'auto_assigned' => $autoAssigned ? [
+                    'id' => $autoAssigned->id,
+                    'name' => $autoAssigned->display_name,
+                    'url' => route('admin.chats.show', $autoAssigned),
+                ] : null,
+            ]);
+        }
+
+        return isset($emailFailed)
+            ? back()->with('error', 'Balasan tersimpan, tetapi email ke pengunjung gagal terkirim. Periksa Pengaturan → Email.')
+            : back();
+    }
+
+    /**
+     * Draf balasan AI untuk admin -- hanya mengembalikan teks; admin yang
+     * mengedit dan mengirimnya sendiri.
+     */
+    public function aiDraft(ChatConversation $chat, \App\Services\Chat\AiReplyDrafter $drafter): JsonResponse
+    {
+        $rows = $chat->messages()
+            ->whereIn('sender', ['user', 'admin', 'bot'])
+            ->orderByDesc('id')->limit(20)->get()->reverse()
+            ->map(fn ($m) => [
+                'role' => $m->sender === 'user' ? 'user' : 'assistant',
+                'content' => $m->message ?: '(mengirim lampiran/berkas)',
+            ])->values()->all();
+
+        $r = $drafter->draft(
+            \App\Services\Chat\AiReplyDrafter::normalize($rows),
+            $chat->id,
+            (string) $chat->display_name,
+            'Live Chat'
+        );
+
+        return response()->json($r, $r['ok'] ? 200 : 422);
+    }
+
+    public function close(ChatConversation $chat): RedirectResponse
+    {
+        $chat->update(['status' => 'closed']);
+
+        return redirect()->route('admin.chats')->with('success', 'Percakapan ditutup.');
+    }
+
+    /**
+     * Jadikan percakapan chat sebagai tiket support -- transkrip
+     * percakapan disalin jadi pesan pertama tiket, supaya konteksnya
+     * tidak hilang. Balasan SELANJUTNYA berjalan lewat sistem tiket
+     * (bukan lagi chat), yang otomatis mengirim email ke klien setiap
+     * staf membalas -- chat sendiri tidak pernah memberi tahu klien
+     * lewat email kalau mereka sudah menutup tab browser-nya.
+     */
+    public function convertToTicket(ChatConversation $chat): RedirectResponse
+    {
+        if (! $chat->client_id) {
+            return back()->with('error', 'Percakapan ini dari pengunjung anonim (belum login) — tiket cuma bisa dibuat untuk klien terdaftar.');
+        }
+
+        if ($chat->ticket_id) {
+            return redirect()->route('admin.tickets.details', $chat->ticket_id);
+        }
+
+        $chat->load('messages');
+
+        $ticket = \App\Models\Ticket::create([
+            'client_id'  => $chat->client_id,
+            'subject'    => 'Live Chat — ' . now()->format('d M Y H:i'),
+            'department' => 'support',
+            'priority'   => 'medium',
+            'status'     => 'open',
+        ]);
+
+        $transkrip = $chat->messages->map(function ($m) use ($chat) {
+            $pengirim = $m->sender === 'admin' ? ($m->admin->name ?? 'Staf') : $chat->display_name;
+
+            return "{$pengirim}: {$m->message}";
+        })->implode("\n");
+
+        $ticket->replies()->create([
+            'client_id' => $chat->client_id,
+            'message'   => "[Dipindahkan dari Live Chat]\n\n" . $transkrip,
+        ]);
+
+        $chat->update(['ticket_id' => $ticket->id, 'status' => 'closed']);
+
+        return redirect()->route('admin.tickets.details', $ticket)
+            ->with('success', 'Percakapan berhasil dijadikan tiket ' . $ticket->ticket_number . '. Balasan Anda selanjutnya di sini otomatis dikirim ke email klien.');
+    }
+
+    public function destroy(ChatConversation $chat): RedirectResponse
+    {
+        $chat->delete();
+
+        return redirect()->route('admin.chats')->with('success', 'Percakapan dihapus.');
+    }
+
+    /**
+     * Dipoll dari SEMUA halaman admin (lewat layout bersama) -- bukan
+     * cuma halaman Live Chat -- supaya badge sidebar & suara notifikasi
+     * tetap jalan walau staf sedang buka halaman lain. Sengaja dibuat
+     * seringan mungkin (cuma hitung angka, tidak load data percakapan).
+     */
+    public function globalStatus(): JsonResponse
+    {
+        $adminId = Auth::guard('admin')->id();
+
+        return response()->json([
+            'unassigned_waiting' => ChatConversation::waitingUnassigned()->count(),
+            'my_unread' => ChatConversation::inLiveChat()->where('assigned_admin_id', $adminId)
+                ->where('unread_for_admin', '>', 0)
+                ->count(),
+        ]);
+    }
+}

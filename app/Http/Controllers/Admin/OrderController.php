@@ -2,285 +2,176 @@
 
 namespace App\Http\Controllers\Admin;
 
+use App\Services\Billing\DeletionGuard;
 use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
+use App\Models\Client;
+use App\Models\HostingAccount;
 use App\Models\Order;
-use App\Models\Hosting;
-use App\Models\Domain;
-use App\Models\DomainRegister; 
-use App\DomainRegisters\Register;
-use App\HostingModule\HostingManager;
-use App\Lib\AfterPayment;
-use App\Lib\SendServiceEmail;
+use App\Enums\OrderStatus;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
 
-class OrderController extends Controller{
+class OrderController extends Controller
+{
 
-    protected function with($with = []){
-        $array = ['invoice.payments.gateway', 'user'];
-        return array_merge($array, $with);
-    } 
-
-    public function orders(){ 
-        $pageTitle = 'All Orders';
-        $orders = $this->orderData();
-        return view('admin.order.all', compact('pageTitle', 'orders'));
+    public function ordersBootstrap(Request $request): View
+    {
+        return view('admin.orders.index', $this->listData($request, null));
     }
 
-    public function pending(){  
-        $pageTitle = 'Pending Orders';
-        $orders = $this->orderData('pending');
-        return view('admin.order.all', compact('pageTitle', 'orders'));
+    public function pendingBootstrap(Request $request): View
+    {
+        return view('admin.orders.index', $this->listData($request, OrderStatus::PendingPayment->value));
     }
 
-    public function active(){  
-        $pageTitle = 'Active Orders'; 
-        $orders = $this->orderData('active');
-        return view('admin.order.all', compact('pageTitle', 'orders'));
+    public function activeBootstrap(Request $request): View
+    {
+        return view('admin.orders.index', $this->listData($request, OrderStatus::Completed->value));
     }
 
-    public function cancelled(){  
-        $pageTitle = 'Cancelled Orders';
-        $orders = $this->orderData('cancelled');
-        return view('admin.order.all', compact('pageTitle', 'orders'));
+    public function suspendedBootstrap(Request $request): View
+    {
+        return view('admin.orders.index', $this->listData($request, OrderStatus::Failed->value));
     }
 
-    public function details($id){    
-        $order = Order::with($this->with(['hostings.product.serviceCategory', 'domains.details', 'hostings.details', 'hostings.product.serverGroup']))->findOrFail($id);
-        $pageTitle = 'Order Details'; 
-        $domainRegisters = DomainRegister::active()->get(['id', 'name']);
-        return view('admin.order.details', compact('pageTitle', 'order', 'domainRegisters'));
+    public function cancelledBootstrap(Request $request): View
+    {
+        return view('admin.orders.index', $this->listData($request, 'cancelled'));
     }
 
-    public function accept(Request $request){
+    private function listData(Request $request, ?string $status): array
+    {
+        $orders = Order::query()
+            ->with('client')
+            ->when($status, fn ($q) => $q->where('status', $status))
+            ->when($request->search, fn ($q) => $q->where('order_number', 'like', "%{$request->search}%")
+                ->orWhere('product_name', 'like', "%{$request->search}%"))
+            ->latest()
+            ->paginate(10)
+            ->withQueryString();
 
-        $request->validate([
-            'order_id'=> 'required|integer'
-        ]);
+        return ['orders' => $orders, 'activeStatus' => $status];
+    }
 
-        $order = Order::pending()->findOrFail($request->order_id);
-        $error = false; 
-        /**
-        * This is an array of hosting from request
-        * For hosting/service operation
-        */
-        foreach($request->hostings ?? [] as $id => $hosting){
-         
-            $hosting = (object) $hosting;
-            $service = $order->hostings->find($id); //Finding the service/hosting
-          
-            if($service){
-                $product = $service->product; //Finding the product for the service/hosting
-                
-                $service->username = @$hosting->username;
-                $service->password = @$hosting->password;
-                $service->server_id = @$hosting->server_id;
-                $service->save();
-                /**
-                * For knowing about status 
-                * @see \App\Models\Hosting go to status method 
-                * @see \App\Models\Order go to status method 
-                */
-                if(@$service->status == 2 && $order->status == 2){ //2 means Pending for both
-                    if(@$hosting->run_create_module && @$product->process() != 'manual'){ //If accept the order and run create module 
-                
-                        $server = $service->server;
-                        $serverGroup = @$server->group;
-                        $execute = HostingManager::init($serverGroup)->create($service);
-            
-                        if(!$execute['success']){
-                            $error = true;
-                            $notify[] = ['error', $execute['message']];
-                        }else{
-                            $service->status = 1; //1 means Active
-                            $service->save();
- 
-                            if(@$hosting->send_email){
-                                SendServiceEmail::serviceNotify($service);
-                            }
-                        }
-                        
-                    }
-                    elseif(!@$hosting->run_create_module){ //If doesn't accept the order
-                        $service->status = 1; //1 means Active
-                        $service->save();
+    public function detailsBootstrap(Order $order): View
+    {
+        $order->load(['client', 'hostingAccount', 'domain', 'invoice', 'invoiceItem.invoice']);
 
-                        if(@$hosting->send_email){
-                            SendServiceEmail::serviceNotify($service);
-                        }
-                    }
-                }
+        return view('admin.orders.details', compact('order'));
+    }
 
-            }
+    public function createBootstrap(): View
+    {
+        $clients = Client::orderBy('name')->get();
+        $hostingAccounts = HostingAccount::orderBy('domain')->get();
 
+        return view('admin.orders.form', ['order' => new Order(), 'clients' => $clients, 'hostingAccounts' => $hostingAccounts]);
+    }
+
+    public function store(Request $request): RedirectResponse
+    {
+        $data = $this->validated($request);
+
+        Order::create($data);
+
+        return redirect()->route('admin.orders')->with('success', 'Order berhasil dibuat.');
+    }
+
+    public function editBootstrap(Order $order): View
+    {
+        $clients = Client::orderBy('name')->get();
+        $hostingAccounts = HostingAccount::orderBy('domain')->get();
+
+        return view('admin.orders.form', ['order' => $order, 'clients' => $clients, 'hostingAccounts' => $hostingAccounts]);
+    }
+
+    public function update(Request $request, Order $order): RedirectResponse
+    {
+        $data = $this->validated($request);
+        $targetStatus = $data['status'];
+        unset($data['status']);
+
+        $order->update($data);
+        if ($targetStatus !== $order->status->value) {
+            $order->transitionTo(OrderStatus::from($targetStatus), 'Status order diubah melalui admin.', auth('admin')->id());
         }
 
-        /**
-        * This is an array of domain from request
-        * For domain operation
-        */
-        foreach($request->domains ?? [] as $id => $domain){
+        return redirect()->route('admin.orders')->with('success', 'Order berhasil diperbarui.');
+    }
 
-            $domain = (object) $domain;
-            $service = $order->domains->find($id); //Finding the domain
-            
-            /**
-            * For knowing about status 
-            * @see \App\Models\Domain go to status method 
-            * @see \App\Models\Order go to status method 
-            */
+    public function destroy(Order $order, DeletionGuard $guard): RedirectResponse
+    {
+        $reason = $guard->deleteLocked($order, fn ($o) => $guard->forOrder($o));
 
-            if($service && DomainRegister::where('id', $domain->register)->exists()){
-                $service->domain_register_id = $domain->register;
-                $service->save();
-    
-                if(@$domain->domain_register){ //If accept the order and run register module 
-                    $register = new Register($service->register->alias); //The Register is a class
-                    $register->domain = $service;
-                    $register->command = 'register';
-                    $execute = $register->run();
-
-                    if(!$execute['success']){ 
-                        $error = true;
-                        $notify[] = ['error', $execute['message']];
-                    }else{
-                        $service->status = !empty($execute['pending']) ? 3 : 1; // 3 = Pending Registration
-                        $service->save(); 
-
-                        if(@$domain->send_email && empty($execute['pending'])){
-                            SendServiceEmail::domainNotify($service);
-                        }
-                    }
-                }else{
-                    $service->status = 1; //1 means Active
-                    $service->save();
-
-                    if(@$domain->send_email){
-                        SendServiceEmail::domainNotify($service);
-                    }
-                }
-    
-            }
-
+        if ($reason) {
+            return back()->with('error', $reason);
         }
 
-        //Finding the renewed records of the domain from the order and item_type 1 means Domain
-        $invoice = $order->invoice;
-        foreach(@$invoice->items()->where('item_type', 1)->where('next_due_date', '!=', null)->groupBy('domain_id')->cursor() as $item){
+        $guard->audit('order', "Order {$order->order_number} dihapus",
+            "Soft delete, bisa dipulihkan: php artisan records:restore order {$order->id}", $order->client_id);
 
-            $domain = $item->domain;
-
-            $renewProcess = new AfterPayment(); //The AfterPayment is a class
-            $response = $renewProcess->domainRenewProcessing($domain, $item);
-
-            if(!$response['success']){
-                $error = true;
-                $notify[] = ['error', $response['message']];
-            }else{
-                $domain->status = 1; //1 means Active  
-                $domain->save();
-            }
-
-        }  
-
-        if(!$error){
-            $order->status = 1; 
-            $order->save();
-            $notify[] = ['success', 'Order accepted successfully'];
-        }
-
-        return back()->withNotify($notify);
+        return redirect()->route('admin.orders')->with('success', 'Order dihapus (soft delete, bisa dipulihkan lewat php artisan records:restore).');
     }
 
-    public function orderNotes(Request $request){
+    /**
+     * Terima order — set status jadi aktif.
+     */
+    public function accept(Request $request): RedirectResponse
+    {
+        $order = Order::findOrFail($request->input('order_id'));
+        $order->transitionTo(OrderStatus::Completed, 'Order diterima secara manual oleh admin.', auth('admin')->id());
 
-        $request->validate([
-            'order_id'=> 'required|integer', 
+        return back()->with('success', "Order #{$order->order_number} diterima & diaktifkan.");
+    }
+
+    /**
+     * Batalkan order.
+     */
+    public function cancel(Request $request): RedirectResponse
+    {
+        $order = Order::findOrFail($request->input('order_id'));
+        $order->cancel('Order dibatalkan oleh admin.', auth('admin')->id());
+
+        return back()->with('success', "Order #{$order->order_number} dibatalkan.");
+    }
+
+    /**
+     * Kembalikan order ke status pending.
+     */
+    public function markPending(Request $request): RedirectResponse
+    {
+        $order = Order::findOrFail($request->input('order_id'));
+        $order->transitionTo(OrderStatus::PendingPayment, 'Order dikembalikan ke pending payment oleh admin.', auth('admin')->id());
+
+        return back()->with('success', "Order #{$order->order_number} dikembalikan ke pending.");
+    }
+
+    /**
+     * Simpan catatan internal staf untuk order ini.
+     */
+    public function orderNotes(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'order_id' => ['required', \Illuminate\Validation\Rule::exists('orders', 'id')->whereNull('deleted_at')],
+            'internal_notes' => ['nullable', 'string'],
         ]);
 
-        $order = Order::findOrFail($request->order_id);
-        $order->admin_notes = $request->admin_notes;
-        $order->save();
+        $order = Order::findOrFail($data['order_id']);
+        $order->update(['internal_notes' => $data['internal_notes']]);
 
-        $notify[] = ['success', 'Order notes updated successfully'];
-        return back()->withNotify($notify);
+        return back()->with('success', 'Catatan order berhasil disimpan.');
     }
 
-    public function cancel(Request $request){
-  
-        $request->validate([
-            'order_id'=> 'required|integer'
+    private function validated(Request $request): array
+    {
+        return $request->validate([
+            'client_id'           => ['required', 'exists:clients,id'],
+            'hosting_account_id'  => ['nullable', 'exists:hosting_accounts,id'],
+            'product_name'        => ['required', 'string', 'max:255'],
+            'order_type'          => ['required', 'in:hosting,domain,vps,addon,other'],
+            'amount'              => ['required', 'numeric', 'min:0'],
+            'status'              => ['required', 'in:draft,requirements_pending,requirements_review,requirements_rejected,requirements_approved,pending_payment,paid,provisioning,completed,failed,cancelled,expired'],
         ]);
-        /**
-        * For knowing about status and order status 2 means Pending
-        * @see \App\Models\Order go to status method 
-        */
-        $order = Order::where('status', 2)->findOrFail($request->order_id);
-        $order->status = 3; //3 means Cancelled
-        $order->save();
-
-        $hostings = $order->hostings;
-        $domains = $order->domains;
-
-        //Trying to make Cancelled all items under the order, 5 means Cancelled
-        Hosting::whereIn('id', $hostings->pluck('id'))->update(['status'=> 5]);
-        Domain::whereIn('id', $domains->pluck('id'))->update(['status'=> 5]);
-
-        //Trying to make Cancelled all items under the order
-        $invoice = $order->invoice;
-        foreach($invoice->items()->where('item_type', 1)->where('next_due_date', '!=', null)->groupBy('domain_id')->cursor() as $renewDomain){
-            $domain = $renewDomain->domain;
-            $domain->status = 5; //5 means Cancelled
-            $domain->save();
-        }   
-
-        $notify[] = ['success', 'Order cancelled successfully'];
-        return back()->withNotify($notify);
     }
-
-    public function markPending(Request $request){
-
-        $request->validate([
-            'order_id'=> 'required|integer'
-        ]);
-        /**
-        * For knowing about status and order status 2 means Pending
-        * @see \App\Models\Order go to status method 
-        */
-        $order = Order::where('status', '!=', 2)->findOrFail($request->order_id);
-        $order->status = 2; //2 means Pending
-        $order->save();
-
-        $hostings = $order->hostings;
-        $domains = $order->domains;
-
-        //Trying to make Pending all items under the order, 2 means Pending
-        Hosting::whereIn('id', $hostings->pluck('id'))->update(['status'=> 2]);
-        Domain::whereIn('id', $domains->pluck('id'))->update(['status'=> 2]);
-
-        //Trying to make Pending all items under the order, 2 means Pending
-        $invoice = $order->invoice;
-        foreach($invoice->items()->where('item_type', 1)->where('next_due_date', '!=', null)->groupBy('domain_id')->cursor() as $renewDomain){
-            $domain = $renewDomain->domain;
-            $domain->status = 2; //2 means Pending
-            $domain->save();
-        }  
-
-        $notify[] = ['success', 'Order set back to pending successfully'];
-        return back()->withNotify($notify);
-    }
-
-    protected function orderData($scope = null){
- 
-        if($scope){
-            $orders = Order::$scope()->with($this->with());
-        }else{
-            $orders = Order::with($this->with());
-        }
-
-        $orders = $orders->searchable(['user:username'])->dateFilter()->orderBy('id','desc')->paginate(getPaginate());
-        return $orders;
-    }
-
 }
-
-

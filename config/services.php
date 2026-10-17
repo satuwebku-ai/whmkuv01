@@ -18,6 +18,10 @@ return [
         'token' => env('POSTMARK_TOKEN'),
     ],
 
+    'resend' => [
+        'key' => env('RESEND_KEY'),
+    ],
+
     'ses' => [
         'key' => env('AWS_ACCESS_KEY_ID'),
         'secret' => env('AWS_SECRET_ACCESS_KEY'),
@@ -31,8 +35,19 @@ return [
         ],
     ],
 
-    'cron' => [
-        'secret' => env('CRON_SECRET'),
+    /*
+    |--------------------------------------------------------------------------
+    | Google — Login klien dengan akun Google
+    |--------------------------------------------------------------------------
+    | Dipakai oleh Laravel Socialite (GoogleAuthController). Kredensial
+    | didapat dari Google Cloud Console → APIs & Services → Credentials.
+    | redirect harus PERSIS sama dengan yang didaftarkan di sana, termasuk
+    | https:// dan tanpa garis miring di akhir.
+    */
+    'google' => [
+        'client_id' => env('GOOGLE_CLIENT_ID'),
+        'client_secret' => env('GOOGLE_CLIENT_SECRET'),
+        'redirect' => env('GOOGLE_REDIRECT_URI'),
     ],
 
 ];

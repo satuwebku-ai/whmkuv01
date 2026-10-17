@@ -1,0 +1,83 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('coupons', function (Blueprint $table) {
+            $table->id();
+            $table->string('code')->unique();
+
+            // Tampilan halaman Promo publik: judul & keterangan promo.
+            $table->string('title')->nullable();
+            $table->text('description')->nullable();
+            $table->enum('type', ['percent', 'fixed'])->default('percent');
+            $table->decimal('value', 12, 2); // persen (0-100) atau rupiah tetap
+
+            // 'all' (berlaku ke semua produk) atau 'specific' (dibatasi ke
+            // produk/kategori tertentu lewat dua tabel pivot di bawah).
+            $table->enum('applies_to', ['all', 'specific'])->default('all');
+
+            // TLD sasaran kupon "Tertentu" (JSON daftar id tlds), untuk
+            // registrasi domain baru.
+            $table->json('tld_ids')->nullable();
+
+            $table->decimal('min_order', 12, 2)->default(0); // subtotal minimum supaya kupon berlaku
+            $table->decimal('max_discount', 12, 2)->nullable(); // batas potongan untuk kupon persen
+
+            $table->unsignedInteger('usage_limit')->nullable(); // null = tak terbatas
+            $table->unsignedInteger('usage_count')->default(0);
+            $table->unsignedInteger('usage_limit_per_client')->default(1);
+
+            $table->date('starts_at')->nullable();
+            $table->date('expires_at')->nullable();
+
+            $table->boolean('is_active')->default(true);
+            // Tampilkan kupon ini di halaman Promo publik (default tidak).
+            $table->boolean('is_public')->default(false);
+            $table->timestamps();
+        });
+
+        Schema::table('invoices', function (Blueprint $table) {
+            $table->foreign('coupon_id')->references('id')->on('coupons')->nullOnDelete();
+        });
+
+        // Produk tertentu yang jadi sasaran kupon — dipisah dari kategori
+        // supaya admin bisa pilih salah satu, atau gabungan keduanya
+        // (mis. "semua produk kategori Hosting" + "satu produk VPS
+        // tertentu di luar kategori itu").
+        Schema::create('coupon_product', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('coupon_id')->constrained()->cascadeOnDelete();
+            $table->foreignId('product_id')->constrained()->cascadeOnDelete();
+            $table->timestamps();
+            $table->unique(['coupon_id', 'product_id']);
+        });
+
+        Schema::create('coupon_product_group', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('coupon_id')->constrained()->cascadeOnDelete();
+            $table->foreignId('product_category_id')->constrained('product_groups')->cascadeOnDelete();
+            $table->timestamps();
+            $table->unique(['coupon_id', 'product_category_id']);
+            $table->index(['coupon_id', 'product_category_id'], 'coupon_product_group_category_index');
+        });
+
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('coupon_product_group');
+        Schema::dropIfExists('coupon_product');
+
+        Schema::table('invoices', function (Blueprint $table) {
+            $table->dropForeign(['coupon_id']);
+        });
+
+        Schema::dropIfExists('coupons');
+    }
+};

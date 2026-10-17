@@ -3,22 +3,14 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 
-class Permission extends Model {
+class Permission extends Model
+{
+    protected $fillable = ['name', 'slug', 'group'];
 
-    public $timestamps = false;
-
-    public $excludedActions = ['LoginController', 'ForgotPasswordController', 'ResetPasswordController', 'PermissionController', 'AdminController@profile', 'AdminController@profileUpdate', 'AdminController@password', 'AdminController@passwordUpdate'];
-
-    public function roles() {
+    public function roles(): BelongsToMany
+    {
         return $this->belongsToMany(Role::class);
     }
-
-    protected static function boot() {
-        parent::boot();
-        static::saved(function () {
-            \Cache::forget('AllPermissions');
-        });
-    }
-
 }

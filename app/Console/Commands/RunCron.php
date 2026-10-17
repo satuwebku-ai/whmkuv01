@@ -1,0 +1,154 @@
+<?php
+
+namespace App\Console\Commands;
+
+use App\Models\CronJob;
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
+use RuntimeException;
+use Throwable;
+
+/**
+ * Menjalankan semua tugas terjadwal yang sudah waktunya.
+ *
+ * Ini satu-satunya perintah yang perlu dipasang di cron server. Jadwal
+ * tiap tugas diatur dari panel admin, bukan dari baris cron — supaya
+ * mengubah jadwal tidak perlu akses SSH atau cPanel lagi.
+ */
+class RunCron extends Command
+{
+    public const SKIPPED_MARKER = '[LUMORA_CRON_SKIPPED]';
+
+    protected $signature = 'lumora:cron
+                            {--job= : Jalankan satu tugas tertentu berdasarkan key, abaikan jadwal}
+                            {--force : Jalankan meski belum waktunya}';
+
+    protected $description = 'Jalankan tugas terjadwal yang sudah waktunya';
+
+    public function handle(): int
+    {
+        CronJob::syncBuiltIn();
+
+        $exit = $this->runDueJobs();
+
+        // Antrean (email/WhatsApp transaksi, aktivasi setelah bayar) ikut
+        // dikuras di setiap tick cron, SETELAH tugas terjadwal supaya tugas
+        // panjang tidak menunda notifikasi dan sebaliknya. Memakai --job=
+        // berarti menjalankan satu tugas tertentu saja, jadi dilewati.
+        // Gagal menguras antrean tidak mengubah exit code tugas terjadwal.
+        if (! $this->option('job')) {
+            $result = app(\App\Services\QueueDrainer::class)->drain();
+            $this->line('Antrean: ' . $result['message']);
+        }
+
+        return $exit;
+    }
+
+    private function runDueJobs(): int
+    {
+        $requestedJob = $this->option('job');
+        if ($requestedJob && ! array_key_exists($requestedJob, CronJob::BUILT_IN)) {
+            $this->error("Tugas [{$requestedJob}] tidak ada di registry Cron bawaan.");
+
+            return self::FAILURE;
+        }
+
+        // Hanya job yang masih terdaftar di kode boleh dijalankan. Baris
+        // lama yang tertinggal di database tetap dipertahankan untuk audit,
+        // tetapi tidak dapat hidup kembali setelah dikeluarkan dari registry.
+        $query = CronJob::whereIn('key', array_keys(CronJob::BUILT_IN));
+        $jobs = $requestedJob
+            ? $query->where('key', $requestedJob)->get()
+            : ($this->option('force')
+                ? $query->where('is_enabled', true)->get()
+                : $query->due()->get());
+
+        if ($jobs->isEmpty()) {
+            $this->line('Tidak ada tugas yang perlu dijalankan.');
+
+            return self::SUCCESS;
+        }
+
+        $failed = 0;
+
+        foreach ($jobs as $job) {
+            if (! $this->runJob($job)) {
+                $failed++;
+            }
+        }
+
+        // Tetap jalankan seluruh job meski satu gagal, tetapi kembalikan
+        // exit code gagal agar cron/monitoring server dapat mendeteksi masalah.
+        return $failed > 0 ? self::FAILURE : self::SUCCESS;
+    }
+
+    private function runJob(CronJob $job): bool
+    {
+        // Cron server bisa memanggil lumora:cron lebih dari sekali secara
+        // bersamaan (mis. overlap, retry, atau dua entry cPanel). Lock per
+        // tugas memastikan satu job tidak diproses paralel. TTL mencegah lock
+        // tertinggal selamanya bila PHP mati mendadak.
+        $lock = Cache::lock("lumora:cron:{$job->key}", 21600);
+
+        if (! $lock->get()) {
+            $this->warn(self::SKIPPED_MARKER . " {$job->key}: {$job->name} sedang berjalan di proses lain.");
+            return true;
+        }
+
+        $this->line("Menjalankan: {$job->name} ({$job->command})");
+
+        $runCountBefore = (int) $job->run_count;
+        $job->update(['last_status' => 'running']);
+        $mulai = microtime(true);
+
+        try {
+            // Output ditangkap supaya bisa ditampilkan di panel admin —
+            // tanpa ini, kegagalan tugas hanya terlihat di log server.
+            $exitCode = Artisan::call(
+                $job->command,
+                CronJob::COMMAND_OPTIONS[$job->key] ?? [],
+            );
+            $output = trim(Artisan::output());
+
+            if ($exitCode !== self::SUCCESS) {
+                throw new RuntimeException(
+                    $output !== '' ? $output : "Command {$job->command} berhenti dengan exit code {$exitCode}."
+                );
+            }
+
+            // Hanya dispatcher ini yang memiliki status eksekusi Cron; satu
+            // pemanggilan job selalu menghasilkan tepat satu run_count.
+            $job->update([
+                'last_status' => 'success',
+                'last_output' => mb_substr($output, 0, 2000),
+                'last_run_at' => now(),
+                'next_run_at' => now()->addMinutes($job->interval_minutes),
+                'last_duration_ms' => (int) ((microtime(true) - $mulai) * 1000),
+                'run_count' => $runCountBefore + 1,
+            ]);
+
+            $this->info('  selesai');
+            return true;
+        } catch (Throwable $e) {
+            // Kegagalan satu tugas tidak boleh menghentikan tugas lain,
+            // jadi errornya dicatat lalu proses lanjut.
+            $job->refresh();
+            $job->update([
+                'last_status' => 'failed',
+                'last_output' => mb_substr($e->getMessage(), 0, 2000),
+                'last_run_at' => now(),
+                // Tetap dijadwalkan ulang supaya gangguan sesaat bisa pulih
+                // sendiri tanpa perlu diutak-atik manual.
+                'next_run_at' => now()->addMinutes($job->interval_minutes),
+                'last_duration_ms' => (int) ((microtime(true) - $mulai) * 1000),
+                'run_count' => $runCountBefore + 1,
+            ]);
+
+            $this->error('  gagal: ' . $e->getMessage());
+            return false;
+        } finally {
+            optional($lock)->release();
+        }
+    }
+}

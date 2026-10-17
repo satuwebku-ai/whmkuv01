@@ -1,0 +1,183 @@
+<?php
+
+namespace App\Http\Controllers\Site;
+
+use App\Http\Controllers\Controller;
+use App\Models\Product;
+use App\Models\Addon;
+use App\Models\ProductGroup;
+use App\Models\TldPremium;
+use App\Services\Cart\CartService;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
+
+class CartController extends Controller
+{
+
+    public function indexBootstrap(CartService $cart): View
+    {
+        return view('public.cart.index', $this->indexData($cart));
+    }
+
+    private function indexData(CartService $cart): array
+    {
+        // Menyegarkan harga domain di keranjang dengan harga terkini
+        // (TLD & add-on ID Protection) — lihat penjelasan lengkap di
+        // CartService::refreshPricing().
+        $cart->refreshPricing();
+
+        // Ditampilkan di sidebar keranjang supaya pengunjung tetap bisa
+        // menjelajah kategori lain tanpa harus kembali ke halaman utama —
+        // paling berguna justru saat keranjang masih kosong.
+        $categories = ProductGroup::active()
+            ->withCount(['products' => fn ($q) => $q->active()])
+            ->orderBy('sort_order')
+            ->orderBy('name')
+            ->get()
+            ->filter(fn ($cat) => $cat->products_count > 0);
+
+        return [
+            'items' => $cart->items(),
+            'subtotal' => $cart->subtotal(),
+            'categories' => $categories,
+        ];
+    }
+
+    public function addProduct(Request $request, CartService $cart): RedirectResponse
+    {
+        $data = $request->validate([
+            'product_id'   => ['required', 'exists:products,id'],
+            'billing_cycle' => ['required', 'in:monthly,quarterly,semi_annually,annually,custom'],
+            'domain_mode'  => ['nullable', 'in:register,transfer,existing'],
+            'domain_name'  => ['nullable', 'string', 'max:255'],
+            'transfer_auth_code' => ['nullable', 'string', 'max:255'],
+            'options'      => ['nullable', 'array'],
+        ]);
+
+        $product = Product::findOrFail($data['product_id']);
+
+        $result = $cart->addProduct(
+            $product,
+            $data['billing_cycle'],
+            $data['domain_mode'] ?? null,
+            $data['domain_name'] ?? null,
+            $data['transfer_auth_code'] ?? null,
+            $data['options'] ?? [],
+        );
+
+        if (! $result['success']) {
+            return back()->withInput()->with('error', $result['message']);
+        }
+
+        return redirect()->route('cart.index')->with('success', $result['message']);
+    }
+
+    public function addAddon(Request $request, CartService $cart): RedirectResponse
+    {
+        $data = $request->validate([
+            'addon_id' => ['required', 'exists:addons,id'],
+            'billing_cycle' => ['required', 'in:monthly,quarterly,semi_annually,annually'],
+            'license_ip' => ['nullable', 'string', 'max:45'],
+        ]);
+
+        $addon = Addon::findOrFail($data['addon_id']);
+        $ip = isset($data['license_ip']) ? trim($data['license_ip']) : null;
+
+        if ($addon->requiresIp() && ! Addon::isValidPublicIp($ip)) {
+            return back()->withInput()->withErrors([
+                'license_ip' => $ip ? 'IP tidak valid. Gunakan IPv4 publik server Anda (bukan 192.168.x, 10.x, atau 127.x).' : 'IP server wajib diisi.',
+            ]);
+        }
+
+        $result = $cart->addAddon($addon, $data['billing_cycle'], $addon->requiresIp() ? $ip : null);
+
+        if (! $result['success']) {
+            return back()->withInput()->with('error', $result['message']);
+        }
+
+        return redirect()->route('cart.index')->with('success', $result['message']);
+    }
+
+    public function updateProductCycle(Request $request, CartService $cart): RedirectResponse
+    {
+        $data = $request->validate([
+            'key' => ['required', 'string'],
+            'billing_cycle' => ['required', 'in:monthly,quarterly,semi_annually,annually,custom'],
+        ]);
+
+        $cart->updateProductCycle($data['key'], $data['billing_cycle']);
+
+        return back()->with('success', 'Siklus tagihan diperbarui.');
+    }
+
+    /**
+     * Tambah domain premium keluarga .id (harga tetap, dipilih dari
+     * daftar harga di halaman Domain Premium) ke keranjang.
+     */
+    public function addPremiumDomain(Request $request, CartService $cart): RedirectResponse
+    {
+        $data = $request->validate([
+            'tld_premium_id' => ['required', 'exists:tld_premiums,id'],
+            'domain_label'   => ['required', 'string', 'max:63'],
+        ]);
+
+        $premium = TldPremium::findOrFail($data['tld_premium_id']);
+
+        $result = $cart->addPremiumDomain($data['domain_label'], $premium);
+
+        if (! $result['success']) {
+            return back()->withInput()->with('error', $result['message']);
+        }
+
+        return redirect()->route('cart.index')->with('success', $result['message']);
+    }
+
+    public function addCustomPremium(Request $request, CartService $cart): RedirectResponse
+    {
+        $data = $request->validate([
+            'custom_premium_id' => ['required', 'exists:custom_premium_domains,id'],
+        ]);
+
+        $result = $cart->addCustomPremium(\App\Models\CustomPremiumDomain::findOrFail($data['custom_premium_id']));
+
+        if (! $result['success']) {
+            return back()->withInput()->with('error', $result['message']);
+        }
+
+        return redirect()->route('cart.index')->with('success', $result['message']);
+    }
+
+    public function updateDomainYears(Request $request, CartService $cart): RedirectResponse
+    {
+        $data = $request->validate([
+            'key' => ['required', 'string'],
+            'years' => ['required', 'integer', 'min:1', 'max:10'],
+        ]);
+
+        $cart->updateDomainYears($data['key'], $data['years']);
+
+        return back()->with('success', 'Lama registrasi domain diperbarui.');
+    }
+
+    public function toggleWhoisPrivacy(Request $request, CartService $cart): RedirectResponse
+    {
+        $cart->toggleWhoisPrivacy($request->input('key'));
+
+        return back();
+    }
+
+    public function remove(Request $request, CartService $cart): RedirectResponse
+    {
+        $cart->remove($request->input('key'));
+
+        return back()->with('success', 'Item dihapus dari keranjang.');
+    }
+
+    public function clear(CartService $cart): RedirectResponse
+    {
+        $cart->clear();
+
+        return back()->with('success', 'Keranjang dikosongkan.');
+    }
+}

@@ -2,239 +2,536 @@
 
 namespace App\Http\Controllers\Admin;
 
-use App\HostingModule\HostingManager;
+use App\Services\Billing\DeletionGuard;
 use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
 use App\Models\Product;
-use App\Models\ConfigurableGroup;
-use App\Models\ServerGroup;
-use App\Models\ServiceCategory;
-use App\Models\Pricing;
-use Illuminate\Support\Facades\Validator;
-use Illuminate\Validation\Rule;
+use App\Models\ProductGroup;
+use App\Models\ProductType;
+use App\Models\Server;
+use App\Services\Billing\HourlyRateCalculator;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+use Illuminate\View\View;
 
 class ProductController extends Controller
 {
-
-    public function products()
+    public function index(Request $request): View
     {
-        $pageTitle = 'All Products';
-
-        $groupByCategories = ServiceCategory::with(['products' => function ($product) {
-            $product->select('id', 'name', 'category_id', 'product_type', 'payment_type', 'stock_control', 'stock_quantity', 'domain_register', 'status', 'module_option', 'server_group_id');
-        }])->get(['id', 'name']);
-
-        return view('admin.product.all', compact('pageTitle', 'groupByCategories'));
+        return view('admin.products.index', $this->indexData($request));
     }
 
-    public function addProductPage()
+    private function indexData(Request $request): array
     {
-        $pageTitle = 'Add New Product';
-        $categories = ServiceCategory::active()->get();
+        // Produk VPS dibedakan dari produk hosting biasa lewat
+        // Product::scopeVpsType()/scopeHostingType() -- kategori
+        // (product_groups.type='vps') sebagai sumber utama, server cloud
+        // sebagai jaring pengaman. Query yang sama dipakai di beranda
+        // publik (CatalogController) supaya sebuah produk tidak bisa
+        // dianggap "hosting" di satu tempat dan "VPS" di tempat lain.
+        $cloudServerIds = Server::cloud()->pluck('id');
 
-        $serverGroups = ServerGroup::active()->whereHas('servers', function ($server) {
-            $server->active($server);
-        })->get();
+        // Daftar dikelompokkan per grup (urutan grup = urutan manual di
+        // Kategori Produk), dan produk di dalamnya urut sesuai susunan manual.
+        // Filter hanya mempersempit isi; urutannya tetap sama dengan yang
+        // dilihat pelanggan di katalog publik.
+        $filterProducts = function ($q) use ($request) {
+            $q->when($request->search, fn ($w) => $w->where('name', 'like', "%{$request->search}%"))
+              ->orderBy('sort_order')
+              ->orderBy('name');
+        };
 
-        return view('admin.product.add', compact('pageTitle', 'categories', 'serverGroups'));
+        $filtering = filled($request->search);
+
+        $groups = ProductGroup::query()
+            ->when($request->category_id, fn ($q) => $q->whereKey($request->category_id))
+            ->when($request->jenis, fn ($q) => $q->where('product_type_id', $request->jenis))
+            ->with(['productType', 'products' => $filterProducts])
+            ->orderBy('sort_order')
+            ->orderBy('name')
+            ->get()
+            // Saat mencari/menyaring jenis, sembunyikan grup yang kosong supaya
+            // hasilnya tidak tertutup banyak grup tanpa produk.
+            ->when($filtering, fn ($c) => $c->filter(fn ($g) => $g->products->isNotEmpty())->values());
+
+        // Baris produk memakai $product->category; isi dari grupnya sendiri
+        // supaya tidak ada query tambahan per baris.
+        $groups->each(fn ($g) => $g->products->each->setRelation('category', $g));
+
+        // Seret-urut dimatikan selama pencarian: daftar parsial tidak boleh
+        // menulis ulang urutan produk yang tidak ikut tampil.
+        $canReorder = ! filled($request->search);
+
+        $categories = ProductGroup::orderBy('sort_order')->orderBy('name')->get();
+
+        // Pil filter per Jenis (dibuat manual di Jenis Produk) + jumlah produknya.
+        $types = ProductType::orderBy('sort_order')->orderBy('name')->get();
+        $typeCounts = Product::query()
+            ->join('product_groups', 'products.product_category_id', '=', 'product_groups.id')
+            ->selectRaw('product_groups.product_type_id as tid, count(*) as c')
+            ->groupBy('product_groups.product_type_id')
+            ->pluck('c', 'tid');
+        $counts = ['all' => Product::count()];
+
+        return compact('groups', 'categories', 'counts', 'cloudServerIds', 'canReorder', 'types', 'typeCounts');
     }
 
-    public function addProduct(Request $request)
+    public function create(Request $request): View
     {
-        if (!preg_match("/^[0-9a-zA-Z-]+$/", $request->slug)) {
-            $notify[] = ['error', 'Please provide a valid slug'];
-            return back()->withNotify($notify);
-        }
-
-        $request->validate([
-            'name' => 'required|max:255',
-            'product_type' => 'required|integer|between:1,4',
-            'service_category' => 'required|exists:service_categories,id',
-
-            'module_option' => 'sometimes|between:1,3',
-            'server_group' => $request->server_group ? 'required|exists:server_groups,id' : 'nullable',
-            'package_name' => $request->server_group ? 'required' : 'nullable',
-
-            'slug' => [
-                'required',
-                'max:255',
-                Rule::unique('products')->where(function ($query) use ($request) {
-                    return $query->where('category_id', $request->service_category)->where('slug', $request->slug);
-                }),
-            ],
-            'server_id' => 'nullable|exists:servers,id',
-        ]);
-
+        // Tombol "Produk di grup ini" mengirim ?category_id supaya grup terisi.
         $product = new Product();
-        $product->module_option = $request->module_option ?? 3;
 
-        $product->package_name = $request->package_name;
-        $product->server_id = $request->server_id ?? 0;
+        if ($request->filled('category_id') && ProductGroup::whereKey($request->category_id)->exists()) {
+            $product->product_category_id = (int) $request->category_id;
+        }
 
-        $product->category_id = $request->service_category;
-        $product->server_group_id = $request->server_group ?? 0;
-        $product->product_type = $request->product_type;
-
-        $product->name = $request->name;
-        $product->slug = $request->slug;
-        $product->save();
-
-        $pricing = new Pricing();
-        $pricing->type = 'product';
-        $pricing->product_id = $product->id;
-
-        //Negative one means disable
-        $pricing->monthly = -1;
-        $pricing->quarterly = -1;
-        $pricing->semi_annually = -1;
-        $pricing->annually = -1;
-        $pricing->biennially = -1;
-        $pricing->triennially = -1;
-        $pricing->save();
-
-        $notify[] = ['success', 'Product added successfully'];
-        return redirect()->route('admin.product.update.page', $product->id)->withNotify($notify);
+        return $this->formView($product);
     }
 
-    public function editProductPage($id)
-    {   
-        $pageTitle = 'Update Product';
-
-        $product = Product::with('getConfigs')->findOrFail($id);
-        $categories = ServiceCategory::where('status', 1)->get();
-        $configGroups = ConfigurableGroup::where('status', 1)->orderBy('id', 'DESC')->get();
-
-        $serverGroups = ServerGroup::active()->whereHas('servers', function ($server) {
-            $server->active($server);
-        })->get();
-
-        $serverGroup = @$product->serverGroup;
-        $execute = HostingManager::init($serverGroup)->getPackage($serverGroup);
-        $packages = $execute['data'] ?? [];
-        
-        return view('admin.product.edit', compact('pageTitle', 'categories', 'configGroups', 'serverGroups', 'product', 'packages'));
-    }
-
-    public function updateProduct(Request $request)
+    public function store(Request $request): RedirectResponse
     {
-        if (!preg_match("/^[0-9a-zA-Z-]+$/", $request->slug)) {
-            $notify[] = ['error', 'Please provide a valid slug'];
-            return back()->withNotify($notify);
+        [$data, $warnings] = $this->preparedData($request);
+
+        // Produk baru masuk paling bawah di grupnya; susun ulang dari daftar.
+        if (blank($request->input('sort_order'))) {
+            $data['sort_order'] = (int) Product::where('product_category_id', $data['product_category_id'])->max('sort_order') + 1;
         }
 
-        $request->validate([
-            'id' => 'required',
-            'name' => 'required|max:255',
-            'product_type' => 'required|integer|between:1,4',
-            'welcome_email' => 'required|integer|between:0,4',
-            'service_category' => 'required|exists:service_categories,id',
-            'domain_registration' => 'required|integer|in:0,1',
-            'stock_control' => 'required|integer|in:0,1',
-            'stock_quantity' => 'required_if:stock_control,==,1|integer|gte:0',
+        Product::create($data);
 
-            'assigned_config_group' => 'sometimes|array',
-            'assigned_config_group.*' => 'sometimes|exists:configurable_groups,id',
-
-            'description' => 'sometimes|max:65000',
-            'module_option' => 'sometimes|between:1,3',
-
-            'server_group' => $request->server_group ? 'required|exists:server_groups,id' : 'nullable',
-            'package_name' => $request->server_group ? 'required' : 'nullable',
-
-            'slug' => [
-                'required',
-                'max:255',
-                Rule::unique('products')->ignore($request->id)->where(function ($query) use ($request) {
-                    return $query->where('category_id', $request->service_category)->where('slug', $request->slug);
-                }),
-            ],
-
-            'payment_type' => 'required|in:1,2',
-            'monthly_setup_fee' => 'required|numeric',
-            'monthly' => 'required|numeric',
-            'quarterly_setup_fee' => 'required|numeric',
-            'quarterly' => 'required|numeric',
-            'semi_annually_setup_fee' => 'required|numeric',
-            'semi_annually' => 'required|numeric',
-            'annually_setup_fee' => 'required|numeric',
-            'annually' => 'required|numeric',
-            'biennially_setup_fee' => 'required|numeric',
-            'biennially' => 'required|numeric',
-            'triennially_setup_fee' => 'required|numeric',
-            'triennially' => 'required|numeric',
-            'server_id' => 'nullable|exists:servers,id',
-        ]);
-
-        $product = Product::findOrFail($request->id);
-        $product->category_id = $request->service_category;
-        $product->payment_type = $request->payment_type;
-        $product->product_type = $request->product_type;
-        $product->server_group_id = $request->server_group ?? 0;
-        $product->module_option = $request->module_option ?? 3;
-
-        $product->server_id = $request->server_id ?? 0;
-        $product->package_name = $request->package_name;
-
-        $product->name = $request->name;
-        $product->slug = $request->slug;
-
-        $product->welcome_email = $request->welcome_email;
-        $product->domain_register = $request->domain_registration;
-
-        $product->stock_control = $request->stock_control;
-        $product->stock_quantity = $request->stock_quantity;
-        $product->description = $request->description;
-
-        $product->save();
-
-        $product->configures()->sync($request->assigned_config_group);
-
-        //Negative one means disable
-        $pricing = $product->price;
-        $pricing->monthly_setup_fee = $request->monthly_setup_fee;
-        $pricing->monthly = $request->monthly_status ? $request->monthly : -1;
-
-        $pricing->quarterly_setup_fee = $request->quarterly_setup_fee;
-        $pricing->quarterly = $request->quarterly_status ? $request->quarterly : -1;
-
-        $pricing->semi_annually_setup_fee = $request->semi_annually_setup_fee;
-        $pricing->semi_annually = $request->semi_annually_status ? $request->semi_annually : -1;
-
-        $pricing->annually_setup_fee = $request->annually_setup_fee;
-        $pricing->annually = $request->annually_status ? $request->annually : -1;
-
-        $pricing->biennially_setup_fee = $request->biennially_setup_fee;
-        $pricing->biennially = $request->biennially_status ? $request->biennially : -1;
-
-        $pricing->triennially_setup_fee = $request->triennially_setup_fee;
-        $pricing->triennially = $request->triennially_status ? $request->triennially : -1;
-        $pricing->save();
-
-        $notify[] = ['success', 'Product updated successfully'];
-        return back()->withNotify($notify);
+        return $this->savedRedirect('Produk berhasil dibuat.', $warnings);
     }
 
-    public function getServerPackage(Request $request)
-    {   
-        $validator = Validator::make($request->all(), [
-            'server_group_id' => 'required|integer'
-        ]);
-
-        if (!$validator->passes()) {
-            return response()->json(['error' => $validator->errors()->all()]);
-        }
-
-        $serverGroup = ServerGroup::find($request->server_group_id);
-        if (!$serverGroup) {
-            return response()->json(['success' => false, 'message' => 'Sorry, Invalid request']);
-        }
-
-        $execute = HostingManager::init($serverGroup)->getPackage($serverGroup);
-        return $execute;
-    }
-
-    public function status($id)
+    public function edit(Product $product): View
     {
-        return Product::changeStatus($id);
+        return $this->formView($product);
+    }
+
+    public function update(Request $request, Product $product): RedirectResponse
+    {
+        [$data, $warnings] = $this->preparedData($request, $product->id);
+
+        $product->update($data);
+
+        return $this->savedRedirect('Produk berhasil diperbarui.', $warnings);
+    }
+
+    /**
+     * Data siap simpan untuk store()/update(): validasi, mode tagihan,
+     * spesifikasi VPS (panel_package), cek harga, dan peringatan harga
+     * jual di bawah harga modal provider.
+     *
+     * @return array{0: array, 1: string[]}
+     */
+    private function preparedData(Request $request, ?int $ignoreId = null): array
+    {
+        $data = $this->validated($request, $ignoreId);
+        $this->assertCategoryMatchesServer($data);
+        $data['billing_mode'] = $this->normalizedBillingMode($data);
+        $data = $this->withVmSpec($request, $data);
+        $this->assertHasPrice($data);
+        $warnings = $this->pricingWarnings($data);
+
+        return [$this->withExtras($request, $data), $warnings];
+    }
+
+    /**
+     * Kategori VPS (product_groups.type='vps') WAJIB dipasangkan dengan
+     * server cloud. Tanpa ini, produk yang tampak VPS di menu/URL publik
+     * (kategorinya) tapi tidak punya server cloud akan nyasar tampil di
+     * bagian "Paket Hosting Pilihan" halaman depan (lihat
+     * Product::scopeHostingType()) dan tidak dapat spek/harga modal VPS.
+     *
+     * @throws ValidationException
+     */
+    private function assertCategoryMatchesServer(array $data): void
+    {
+        $isVpsCategory = ProductGroup::where('id', $data['product_category_id'])->where('type', 'vps')->exists();
+        $isCloudServer = ! empty($data['server_id']) && Server::cloud()->whereKey($data['server_id'])->exists();
+
+        if ($isVpsCategory && ! $isCloudServer) {
+            throw ValidationException::withMessages(['server_id' => 'Kategori ini bertipe VPS — pilih server bertipe VM/VPS, bukan server hosting biasa.']);
+        }
+
+        if (! $isVpsCategory && $isCloudServer) {
+            throw ValidationException::withMessages(['product_category_id' => 'Server ini bertipe VM/VPS — pilih kategori produk bertipe VPS, bukan Hosting.']);
+        }
+    }
+
+    private function savedRedirect(string $message, array $warnings): RedirectResponse
+    {
+        $redirect = redirect()->route('admin.products.index')->with('success', $message);
+
+        return $warnings ? $redirect->with('warning', implode(' ', $warnings)) : $redirect;
+    }
+
+    private function formView(Product $product): View
+    {
+        $servers = Server::where('is_active', true)->orderBy('name')->get();
+
+        return view('admin.products.form', [
+            'product' => $product,
+            'categories' => ProductGroup::with('productType')->orderBy('name')->get(),
+            'servers' => $servers,
+            'vpsServerMeta' => $this->vpsServerMeta($servers),
+        ]);
+    }
+
+    public function destroy(Product $product, DeletionGuard $guard): RedirectResponse
+    {
+        $reason = $guard->deleteLocked($product, fn ($p) => $guard->forProduct($p));
+
+        if ($reason) {
+            return back()->with('error', $reason);
+        }
+
+        $guard->audit('service', "Produk {$product->name} dihapus");
+
+        return redirect()->route('admin.products.index')->with('success', 'Produk berhasil dihapus.');
+    }
+
+    /**
+     * Simpan urutan manual produk DI DALAM satu grup.
+     * Body: {"ids": [12, 9, 15]} sesuai urutan baru.
+     */
+    public function reorder(Request $request): JsonResponse
+    {
+        $ids = $request->validate([
+            'ids'   => ['required', 'array', 'min:1'],
+            'ids.*' => ['integer', 'exists:products,id'],
+        ])['ids'];
+
+        $groupIds = Product::whereIn('id', $ids)->pluck('product_category_id')->unique();
+
+        if ($groupIds->count() > 1) {
+            return response()->json(['ok' => false, 'message' => 'Produk dari grup berbeda tidak bisa diurutkan bersama.'], 422);
+        }
+
+        DB::transaction(function () use ($ids) {
+            foreach (array_values($ids) as $i => $id) {
+                Product::whereKey($id)->update(['sort_order' => $i + 1]);
+            }
+        });
+
+        return response()->json(['ok' => true]);
+    }
+
+    public function status(Request $request): RedirectResponse
+    {
+        $product = Product::findOrFail($request->input('product_id'));
+        $product->update(['is_active' => ! $product->is_active]);
+
+        return back()->with('success', "Produk {$product->name} berhasil " . ($product->is_active ? 'diaktifkan.' : 'dinonaktifkan.'));
+    }
+
+    /**
+     * Produk tanpa satupun harga siklus terisi tidak bisa dibeli — tolak
+     * sebelum tersimpan, bukan biarkan muncul rusak di katalog.
+     */
+    private function assertHasPrice(array $data): void
+    {
+        // Produk billing_mode='deposit' (VPS Pay As You Grow) tidak
+        // ditagih lewat harga siklus sama sekali -- tarifnya dari kartu
+        // harga SERVER (lihat HourlyRateCalculator), jadi wajib-isi-satu-
+        // harga tidak relevan untuk produk ini.
+        if (($data['billing_mode'] ?? 'invoice') === 'deposit') {
+            return;
+        }
+
+        $hasPrice = collect(['price_monthly', 'price_quarterly', 'price_semi_annually', 'price_annually', 'price_custom'])
+            ->contains(fn ($key) => filled($data[$key] ?? null));
+
+        if (! $hasPrice) {
+            throw \Illuminate\Validation\ValidationException::withMessages([
+                'price_monthly' => 'Isi minimal satu harga siklus tagihan (bulanan/3 bulan/6 bulan/tahunan).',
+            ]);
+        }
+    }
+
+    /**
+     * billing_mode='deposit' cuma valid untuk produk yang server tujuannya
+     * memang server cloud/VPS. Dicek DI SINI (bukan cuma disembunyikan &
+     * dinonaktifkan di form) supaya request langsung yang mengakali field
+     * tidak bisa membuat produk hosting biasa diam-diam jadi "deposit".
+     */
+    private function normalizedBillingMode(array $data): string
+    {
+        $requested = $data['billing_mode'] ?? 'invoice';
+
+        if ($requested !== 'deposit') {
+            return 'invoice';
+        }
+
+        $isCloudServer = ! empty($data['server_id']) && Server::where('id', $data['server_id'])
+            ->cloud()
+            ->exists();
+
+        return $isCloudServer ? 'deposit' : 'invoice';
+    }
+
+    private function withExtras(Request $request, array $data): array
+    {
+        $data['is_active'] = $request->boolean('is_active', true);
+        $data['is_featured'] = $request->boolean('is_featured');
+
+        // Jumlah hari siklus custom CUMA boleh diubah Superadmin -- dijaga
+        // di sini juga (bukan cuma disembunyikan di tampilan), supaya
+        // tidak bisa diakali admin/staff biasa lewat request langsung.
+        if (! auth('admin')->user()->isSuperadmin()) {
+            unset($data['custom_cycle_days']);
+        }
+
+        // Textarea satu fitur per baris -> array bersih (baris kosong dibuang).
+        $features = collect(explode("\n", (string) $request->input('features_raw')))
+            ->map(fn ($line) => trim($line))
+            ->filter()
+            ->values()
+            ->all();
+
+        $data['features'] = $features;
+
+        return $data;
+    }
+
+    private function validated(Request $request, ?int $ignoreId = null): array
+    {
+        return $request->validate([
+            'product_category_id' => ['required', 'exists:product_groups,id'],
+            'name'                => ['required', 'string', 'max:255'],
+            'slug'                => ['nullable', 'string', 'max:255', 'unique:products,slug' . ($ignoreId ? ",{$ignoreId}" : '')],
+            'tagline'             => ['nullable', 'string', 'max:255'],
+            'description'         => ['nullable', 'string'],
+            'price_monthly'       => ['nullable', 'numeric', 'min:0'],
+            'price_quarterly'     => ['nullable', 'numeric', 'min:0'],
+            'price_semi_annually' => ['nullable', 'numeric', 'min:0'],
+            'price_annually'      => ['nullable', 'numeric', 'min:0'],
+            'price_custom'        => ['nullable', 'numeric', 'min:0'],
+            'custom_cycle_days'   => ['nullable', 'integer', 'min:1', 'max:3650'],
+            'setup_fee'           => ['nullable', 'numeric', 'min:0'],
+            'domain_option'       => ['required', 'in:required,optional,none'],
+            'server_id'           => ['nullable', 'exists:servers,id'],
+            'panel_package'       => ['nullable', 'string', 'max:500'],
+            'billing_mode'        => ['nullable', 'in:invoice,deposit'],
+            'pricing_mode'        => ['nullable', 'in:manual,markup'],
+            'markup_percent'      => ['nullable', 'numeric', 'min:0', 'max:1000'],
+            'price_per_vcpu_hour' => ['nullable', 'numeric', 'min:0'],
+            'price_per_ram_gb_hour' => ['nullable', 'numeric', 'min:0'],
+            'price_per_storage_gb_hour' => ['nullable', 'numeric', 'min:0'],
+            'price_per_backup_gb_hour' => ['nullable', 'numeric', 'min:0'],
+            'price_per_snapshot_gb_hour' => ['nullable', 'numeric', 'min:0'],
+            'price_windows_license_per_vcpu_hour' => ['nullable', 'numeric', 'min:0'],
+            'stock'               => ['nullable', 'integer', 'min:0'],
+            'sort_order'          => ['nullable', 'integer', 'min:0'],
+        ]);
+    }
+
+    // ── Spesifikasi & harga VPS (multi-provider) ─────────────────────────
+
+    /** Kolom kartu harga per-jam pada produk (dipakai HourlyRateCalculator). */
+    private const RATE_FIELDS = [
+        'pricing_mode', 'markup_percent', 'price_per_vcpu_hour', 'price_per_ram_gb_hour',
+        'price_per_storage_gb_hour', 'price_per_backup_gb_hour', 'price_per_snapshot_gb_hour',
+        'price_windows_license_per_vcpu_hour',
+    ];
+
+    /**
+     * Merakit spesifikasi VM produk (disimpan sebagai JSON di panel_package)
+     * dari isian form (vm_*) + isian khusus provider di
+     * config/vps_providers.php › product_fields. SATU-SATUNYA tempat spek
+     * VPS produk dirakit (dulu dirakit di JavaScript form).
+     *
+     * Provider berbasis size (mis. DigitalOcean): vCPU/RAM/disk otomatis
+     * mengikuti size yang dipilih, diambil dari data yang ditarik lewat
+     * "Tarik Harga Modal" di halaman Server.
+     *
+     * @throws ValidationException
+     */
+    private function buildVmSpec(Request $request, Server $server): array
+    {
+        $spec = [
+            'vcpu'           => max(1, (int) $request->input('vm_vcpu', 1)),
+            'ram'            => max(512, (int) $request->input('vm_ram', 1024)),
+            'disk'           => max(20, (int) $request->input('vm_disk', 20)),
+            'backup_enabled' => $request->input('vm_backup') === '1',
+        ];
+
+        $errors = [];
+
+        foreach ((array) config('vps_providers.' . $server->vpsDriver() . '.product_fields', []) as $key => $field) {
+            $value = trim((string) $request->input("vm_{$key}", $field['default'] ?? ''));
+
+            if ($value === '') {
+                if ($field['required'] ?? false) {
+                    $errors["vm_{$key}"] = "{$field['label']} wajib diisi untuk provider {$server->vpsLabel()}.";
+                }
+
+                continue;
+            }
+
+            if (! preg_match('/^[A-Za-z0-9._-]{1,100}$/', $value)) {
+                $errors["vm_{$key}"] = "{$field['label']} hanya boleh huruf, angka, titik, strip, dan underscore.";
+
+                continue;
+            }
+
+            $spec[$key] = $value;
+        }
+
+        if (! $errors && $server->costModel() === 'size' && isset($spec['provider_size'])) {
+            $size = $server->cost_cache['sizes'][$spec['provider_size']] ?? null;
+
+            if (! $size) {
+                $errors['vm_provider_size'] = "Size \"{$spec['provider_size']}\" tidak ada di daftar {$server->vpsLabel()}. "
+                    . 'Tarik harga modal di halaman Server dulu, lalu pilih size yang tersedia.';
+            } else {
+                $spec['vcpu'] = $size['vcpu'];
+                $spec['ram'] = $size['ram'];
+                $spec['disk'] = $size['disk'];
+                $spec['backup_enabled'] = false;
+            }
+        }
+
+        if ($errors) {
+            throw ValidationException::withMessages($errors);
+        }
+
+        return $spec;
+    }
+
+    /** Produk di server VPS: panel_package = JSON spek hasil buildVmSpec(). */
+    private function withVmSpec(Request $request, array $data): array
+    {
+        $server = ! empty($data['server_id']) ? Server::cloud()->find($data['server_id']) : null;
+
+        if ($server) {
+            $data['panel_package'] = json_encode($this->buildVmSpec($request, $server));
+        }
+
+        return $data;
+    }
+
+    /**
+     * Cek harga produk VPS terhadap harga modal provider.
+     *  - Deposit: tarif per jam yang dihasilkan WAJIB > 0. Tarif 0 berarti
+     *    VPS tidak pernah ditagih sama sekali (ChargeHourlyUsage melewati
+     *    layanan bertarif 0), jadi ditolak di sini.
+     *  - Harga jual di bawah harga modal: tetap boleh disimpan, tapi
+     *    diperingatkan (deposit: per jam; invoice: harga bulanan vs modal
+     *    730 jam).
+     *
+     * @return string[] peringatan
+     * @throws ValidationException
+     */
+    private function pricingWarnings(array $data): array
+    {
+        $server = ! empty($data['server_id']) ? Server::cloud()->find($data['server_id']) : null;
+
+        if (! $server) {
+            return [];
+        }
+
+        $spec = json_decode((string) ($data['panel_package'] ?? ''), true) ?: [];
+        $modal = HourlyRateCalculator::providerCost($server, $spec);
+
+        if (($data['billing_mode'] ?? 'invoice') === 'deposit') {
+            $draft = (new Product())->forceFill(Arr::only($data, self::RATE_FIELDS));
+            $sell = HourlyRateCalculator::calculate($server, $spec, $draft);
+
+            if ($sell <= 0) {
+                throw ValidationException::withMessages(['pricing_mode' => $this->zeroRateMessage($server, $data, $modal)]);
+            }
+
+            return ($modal > 0 && $sell < $modal)
+                ? [sprintf('Harga jual per jam (Rp %s) di bawah harga modal provider (Rp %s) — produk ini rugi.', number_format($sell, 2, ',', '.'), number_format($modal, 2, ',', '.'))]
+                : [];
+        }
+
+        $monthly = (float) ($data['price_monthly'] ?? 0);
+
+        return ($modal > 0 && $monthly > 0 && $monthly < $modal * 730)
+            ? [sprintf('Harga bulanan (Rp %s) di bawah estimasi harga modal provider sebulan (Rp %s).', number_format($monthly, 0, ',', '.'), number_format($modal * 730, 0, ',', '.'))]
+            : [];
+    }
+
+    private function zeroRateMessage(Server $server, array $data, float $modal): string
+    {
+        if (($data['pricing_mode'] ?? 'manual') === 'markup') {
+            return $modal > 0
+                ? 'Tarif per jam masih 0 — isi Markup (%) lebih dari 0.'
+                : 'Harga modal belum bisa dihitung — tarik harga modal di halaman Server'
+                    . ($server->costFxRate() <= 0 && $server->costCurrency() !== 'IDR' ? ' dan isi kurs ke Rupiah-nya' : '')
+                    . ', atau pakai mode Isi Manual.';
+        }
+
+        return 'Tarif per jam masih 0 — isi minimal harga per vCPU/RAM/Storage di kartu harga, atau pakai mode Markup dari harga modal provider.';
+    }
+
+    /**
+     * Estimasi langsung untuk form Produk VPS: harga modal provider (per jam
+     * & per bulan) untuk spek yang sedang diisi, plus tarif jual per jam
+     * kalau mode tagihnya deposit. Pakai HourlyRateCalculator yang sama
+     * dengan saat simpan/tagih, jadi angkanya selalu konsisten.
+     */
+    public function vpsEstimate(Request $request): JsonResponse
+    {
+        $server = Server::cloud()->find($request->input('server_id'));
+
+        if (! $server) {
+            return response()->json(['ok' => false, 'message' => 'Pilih server VPS dulu.']);
+        }
+
+        try {
+            $spec = $this->buildVmSpec($request, $server);
+        } catch (ValidationException $e) {
+            return response()->json(['ok' => false, 'message' => collect($e->errors())->flatten()->first()]);
+        }
+
+        $modal = HourlyRateCalculator::providerCost($server, $spec);
+        $deposit = $request->input('billing_mode') === 'deposit';
+        $draft = (new Product())->forceFill(Arr::only($request->all(), self::RATE_FIELDS));
+
+        return response()->json([
+            'ok'           => true,
+            'ready'        => $modal > 0,
+            'provider'     => $server->vpsLabel(),
+            'currency'     => $server->costCurrency(),
+            'fx_missing'   => $server->costCurrency() !== 'IDR' && $server->costFxRate() <= 0,
+            'synced'       => (bool) $server->cost_cached_at,
+            'modal_hourly' => $modal,
+            'modal_monthly' => round($modal * 730),
+            'sell_hourly'  => $deposit ? HourlyRateCalculator::calculate($server, $spec, $draft) : null,
+        ]);
+    }
+
+    /**
+     * Data per server VPS untuk form Produk: provider, model harga modal,
+     * status penarikan harga modal, dan daftar size/region hasil tarik
+     * (untuk saran isian provider berbasis size).
+     */
+    private function vpsServerMeta($servers): array
+    {
+        return $servers->filter->isCloud()->mapWithKeys(function (Server $server) {
+            $cache = is_array($server->cost_cache) ? $server->cost_cache : [];
+
+            $sizes = collect($cache['sizes'] ?? [])->map(fn ($size) => sprintf(
+                '%d vCPU · %s GB RAM · %d GB disk — %s %s/bln',
+                $size['vcpu'], rtrim(rtrim(number_format($size['ram'] / 1024, 1), '0'), '.'), $size['disk'],
+                $server->costCurrency(), number_format((float) $size['monthly'], 2)
+            ))->all();
+
+            return [$server->id => [
+                'driver'   => $server->vpsDriver(),
+                'label'    => $server->vpsLabel(),
+                'model'    => $server->costModel(),
+                'currency' => $server->costCurrency(),
+                'synced'   => (bool) $server->cost_cached_at,
+                'fxReady'  => $server->costFxRate() > 0,
+                'sizes'    => $sizes,
+                'regions'  => $cache['regions'] ?? [],
+            ]];
+        })->all();
     }
 }

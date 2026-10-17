@@ -4,100 +4,228 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class Domain extends Model
 {
-    use HasFactory; 
+    use HasFactory;
 
-    protected $casts = ['next_invoice_date'=>'date', 'expiry_date'=>'date', 'next_due_date'=>'date', 'reg_date'=>'date', 'last_cron'=>'datetime']; 
+    protected $fillable = [
+        'client_id', 'order_id', 'registrar_id', 'tld_id', 'domain_name',
+        'price', 'years', 'status', 'register_date', 'expiry_date',
+        'auto_renew', 'whois_privacy', 'nameservers',
+        'is_premium', 'tld_premium_id',
+        'provision_status', 'provision_message', 'internal_notes',
+        'renewal_invoice_id', 'is_transfer', 'transfer_auth_code',
+        'eligibility_criteria', 'eligibility_extra', 'documents_verified_at',
+        'privacy_invoice_id', 'privacy_expires_at',
+        'provisioning_started_at', 'provisioning_finished_at', 'provisioning_attempts', 'provisioning_key',
+    ];
 
-    public function scopeActive($query){
-        return $query->where('status', 1);
-    }
-
-    public function details(){
-        return $this->hasOne(InvoiceItem::class);
-    }
-
-    public function deposit(){ 
-        return $this->belongsTo(Deposit::class, 'deposit_id');
-    }
-
-    public function hosting(){ 
-        return $this->belongsTo(Hosting::class, 'hosting_id');
-    }
-
-    public function invoices(){
-        return $this->hasMany(Invoice::class, 'domain_id');
-    }
-
-    public function user(){ 
-        return $this->belongsTo(User::class, 'user_id');
-    }
-
-    public function register(){ 
-        return $this->belongsTo(DomainRegister::class, 'domain_register_id');
-    }
-
-    public function showStatus(): Attribute{
-    
-        return new Attribute(
-            get: function(){
-           
-                if(request()->routeIs('admin*')){
-                    $class = "text--small badge font-weight-normal badge--";
-                }else{
-                    $class = "badge badge--";
-                } 
-        
-                $text = 'N/A'; 
-        
-                if ($this->status == 1){
-                    $class .= 'success';
-                    $text = Self::status()[1];
-                }
-                elseif ($this->status == 2){
-                    $class .= 'danger';
-                    $text = Self::status()[2];
-                }
-                elseif ($this->status == 3){
-                    $class .= 'warning';
-                    $text = Self::status()[3];
-                }
-                elseif ($this->status == 4){
-                    $class .= 'danger';
-                    $text = Self::status()[4];
-                }
-                elseif ($this->status == 5){
-                    $class .= 'warning';
-                    $text = Self::status()[5];
-                }
-                
-                return "<span class='$class'>" . trans($text) . "</span>";
-            }
-        );
-    }
-
-    public static function status($implode = false){ 
-
-        $status = [
-            1=> trans('Active'),
-            2=> trans('Pending'), 
-            3=> trans('Pending Registration'),
-            4=> trans('Expired'), 
-            5=> trans('Cancelled'),
+    protected function casts(): array
+    {
+        return [
+            'price' => 'decimal:2',
+            'register_date' => 'date',
+            'expiry_date' => 'date',
+            'auto_renew' => 'boolean',
+            'whois_privacy' => 'boolean',
+            'is_premium' => 'boolean',
+            'nameservers' => 'array',
+            'is_transfer' => 'boolean',
+            'transfer_auth_code' => 'encrypted',
+            'documents_verified_at' => 'datetime',
+            'privacy_expires_at' => 'date',
+            'provisioning_started_at' => 'datetime',
+            'provisioning_finished_at' => 'datetime',
+            'provisioning_attempts' => 'integer',
         ];
+    }
 
-        if($implode){
-            return implode(',', array_keys($status));
+    /**
+     * ID Protection dianggap benar-benar aktif hanya kalau flag-nya
+     * menyala DAN masa berlakunya belum lewat — masa berlaku ini
+     * terpisah dari masa domain (lihat migrasi privacy_expires_at).
+     */
+    public function hasActivePrivacy(): bool
+    {
+        return $this->whois_privacy
+            && $this->privacy_expires_at
+            && $this->privacy_expires_at->isFuture();
+    }
+
+    /**
+     * Apakah domain ini boleh memakai ID Protection / WHOIS Privacy.
+     *
+     * Seluruh keluarga .id (.id, .my.id, .co.id, .web.id, dst) dilarang
+     * PANDI menawarkan WHOIS Privacy. Dicek dari NAMA domain, bukan hanya
+     * dari relasi TLD, supaya tetap benar untuk domain lama yang tld_id-nya
+     * kosong atau TLD-nya dibuat sebelum aturan ini dipasang.
+     */
+    public function supportsPrivacy(): bool
+    {
+        if (Tld::isIdFamily((string) $this->domain_name)) {
+            return false;
         }
 
-        return $status;
+        if ($this->relationLoaded('tld') || $this->tld_id) {
+            return $this->tld?->privacyAllowed() ?? true;
+        }
+
+        return true;
     }
 
+    /** Harga ID Protection (1 tahun) untuk domain ini — lihat Tld::privacyPrice(). */
+    public function privacyPrice(): float
+    {
+        if ($this->tld) {
+            return $this->tld->privacyPrice();
+        }
+
+        if ($this->registrar && $this->registrar->whois_privacy_price !== null) {
+            return (float) $this->registrar->whois_privacy_price;
+        }
+
+        return (float) \App\Models\Setting::get('whois_privacy_price', 0);
+    }
+
+    public function privacyDaysLeft(): ?int
+    {
+        if (! $this->privacy_expires_at) {
+            return null;
+        }
+
+        return (int) now()->startOfDay()->diffInDays($this->privacy_expires_at, false);
+    }
+
+    public function client(): BelongsTo
+    {
+        return $this->belongsTo(Client::class);
+    }
+
+    public function order(): BelongsTo
+    {
+        return $this->belongsTo(Order::class);
+    }
+
+    public function documents(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(\App\Models\DomainDocument::class);
+    }
+
+    public function contacts(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(DomainContact::class);
+    }
+
+    public function privacyInvoice(): BelongsTo
+    {
+        return $this->belongsTo(Invoice::class, 'privacy_invoice_id');
+    }
+
+    public function registrar(): BelongsTo
+    {
+        return $this->belongsTo(Registrar::class);
+    }
+
+    public function tld(): BelongsTo
+    {
+        return $this->belongsTo(Tld::class);
+    }
+
+    public function tldPremium(): BelongsTo
+    {
+        return $this->belongsTo(TldPremium::class);
+    }
+
+    public function renewalInvoice(): BelongsTo
+    {
+        return $this->belongsTo(Invoice::class, 'renewal_invoice_id');
+    }
+
+    /**
+     * Nominal perpanjangan satu tahun, mengikuti harga renew TLD saat ini
+     * (bukan harga registrasi awal — keduanya sering berbeda).
+     */
+    public function markProvisioning(string $message = 'Provisioning domain sedang dijalankan.'): void
+    {
+        $this->increment('provisioning_attempts');
+        $this->forceFill([
+            'provisioning_started_at' => now(),
+            'provisioning_finished_at' => null,
+            'provisioning_key' => $this->provisioning_key ?: (string) \Illuminate\Support\Str::uuid(),
+            'provision_status' => 'provisioning',
+            'provision_message' => $message,
+        ])->save();
+    }
+
+    public function markProvisioningFinished(string $status, string $message): void
+    {
+        $this->forceFill([
+            'provision_status' => $status,
+            'provision_message' => $message,
+            'provisioning_finished_at' => now(),
+        ])->save();
+    }
+
+    public function renewalAmount(): float
+    {
+        // Domain PREMIUM: harga perpanjangan mengikuti baris tld_premiums
+        // (sell_renew_price, atau modal DNAMA kalau belum diisi), BUKAN
+        // harga renew TLD reguler. Dan tidak boleh jatuh ke $this->price
+        // di bawah -- itu harga REGISTRASI premium (bisa jutaan rupiah).
+        if ($this->is_premium) {
+            $premium = $this->tldPremium;
+
+            if (! $premium) {
+                $custom = \App\Models\CustomPremiumDomain::whereRaw('LOWER(domain_name) = ?', [strtolower($this->domain_name)])->first();
+                if ($custom && (float) $custom->renew_price > 0) {
+                    return (float) $custom->renew_price;
+                }
+            }
+
+            $price = $premium ? (float) ($premium->sell_renew_price ?? $premium->cost_renew ?? 0) : 0;
+
+            if ($price > 0) {
+                return $price;
+            }
+
+            if ($this->tld) {
+                return $this->tld->priceForYears(1, 'renew');
+            }
+
+            throw new \RuntimeException("Harga perpanjangan domain premium {$this->domain_name} belum tersedia. Isi harga jual renew di Domain Premium (admin).");
+        }
+
+        return $this->tld ? $this->tld->priceForYears(1, 'renew') : (float) $this->price;
+    }
+
+    /**
+     * Perpanjangan domain dibuka maksimal 30 hari sebelum expiry.
+     * Batas ini berlaku untuk tombol manual maupun invoice otomatis.
+     */
+    public function isWithinRenewalWindow(int $daysBefore = 30): bool
+    {
+        if (! $this->expiry_date) {
+            return false;
+        }
+
+        return $this->expiry_date->lessThanOrEqualTo(now()->addDays($daysBefore));
+    }
+
+    /**
+     * Buat invoice perpanjangan untuk domain ini. Sama seperti
+     * HostingAccount::createRenewalInvoice() — dipakai baik oleh
+     * perintah terjadwal maupun tombol "Perpanjang Sekarang" klien.
+     */
+    public function createRenewalInvoice(): \App\Models\Invoice
+    {
+        return app(\App\Services\Billing\RenewalInvoiceService::class)->createDomainInvoice($this);
+    }
+
+
+    public function getIsExpiringSoonAttribute(): bool
+    {
+        return $this->expiry_date && $this->expiry_date->diffInDays(now(), false) > -30 && $this->expiry_date->isFuture();
+    }
 }
-
-
-
- 

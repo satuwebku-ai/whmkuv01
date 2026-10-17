@@ -3,75 +3,160 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
 use App\Models\Coupon;
+use App\Models\Product;
+use App\Models\ProductGroup;
+use App\Models\Tld;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
 
 class CouponController extends Controller
 {
 
-    public function coupons(){ 
-        $pageTitle = 'All Coupons';
-        $coupons = Coupon::orderBy('id', 'DESC')->paginate(getPaginate());
-        return view('admin.coupon.all', compact('pageTitle', 'coupons'));
+    public function couponsBootstrap(Request $request): View
+    {
+        return view('admin.coupons.index', $this->indexData($request));
     }
 
-    public function add(Request $request){
+    private function indexData(Request $request): array
+    {
+        $coupons = Coupon::query()
+            ->when($request->search, fn ($q) => $q->where('code', 'like', '%' . strtoupper($request->search) . '%'))
+            ->withCount('invoices')
+            ->latest()
+            ->paginate(15)
+            ->withQueryString();
 
-        $request->validate([
-            'name'=> 'required|max:255',
-            'code'=> 'required|max:255|unique:coupons,code',
-            'type'=> 'required|in:0,1',
-            'discount'=> 'required|numeric|gte:0',
-            'min_order_amount'=> 'required|numeric|gte:0'
+        return ['coupons' => $coupons];
+    }
+
+    public function createBootstrap(): View
+    {
+        return view('admin.coupons.form', [
+            'coupon' => new Coupon(),
+            'categories' => ProductGroup::orderBy('name')->get(),
+            'products' => Product::orderBy('name')->get(),
+            'tlds' => Tld::with('registrar')->where('is_active', true)->orderBy('extension')->get(),
+        ]);
+    }
+
+    public function store(Request $request): RedirectResponse
+    {
+        $data = $this->validated($request);
+        $data['is_active'] = $request->boolean('is_active', true);
+        $data['is_public'] = $request->boolean('is_public');
+
+        $coupon = Coupon::create($data);
+        $this->syncScope($request, $coupon);
+
+        return redirect()->route('admin.coupons')->with('success', 'Kupon berhasil dibuat.');
+    }
+
+    public function editBootstrap(Coupon $coupon): View
+    {
+        $coupon->load('products', 'categories');
+
+        return view('admin.coupons.form', [
+            'coupon' => $coupon,
+            'categories' => ProductGroup::orderBy('name')->get(),
+            'products' => Product::orderBy('name')->get(),
+            'tlds' => Tld::with('registrar')->where('is_active', true)->orderBy('extension')->get(),
+        ]);
+    }
+
+    public function update(Request $request, Coupon $coupon): RedirectResponse
+    {
+        $data = $this->validated($request, $coupon->id);
+        $data['is_active'] = $request->boolean('is_active');
+        $data['is_public'] = $request->boolean('is_public');
+
+        $coupon->update($data);
+        $this->syncScope($request, $coupon);
+
+        return redirect()->route('admin.coupons')->with('success', 'Kupon berhasil diperbarui.');
+    }
+
+    public function destroy(Coupon $coupon): RedirectResponse
+    {
+        if ($coupon->invoices()->exists()) {
+            return back()->with('error', 'Kupon tidak bisa dihapus karena sudah pernah dipakai. Nonaktifkan saja.');
+        }
+
+        $coupon->delete();
+
+        return redirect()->route('admin.coupons')->with('success', 'Kupon berhasil dihapus.');
+    }
+
+    public function status(Request $request): RedirectResponse
+    {
+        $coupon = Coupon::findOrFail($request->input('coupon_id'));
+        $coupon->update(['is_active' => ! $coupon->is_active]);
+
+        return back()->with('success', "Kupon {$coupon->code} berhasil " . ($coupon->is_active ? 'diaktifkan.' : 'dinonaktifkan.'));
+    }
+
+    /**
+     * Simpan pilihan kategori/produk sasaran kupon. Kalau applies_to
+     * bukan "specific", pivot-nya dikosongkan — supaya tidak ada sisa
+     * pilihan lama yang mengambang kalau admin ganti pikiran balik ke
+     * "Semua Produk".
+     */
+    private function syncScope(Request $request, Coupon $coupon): void
+    {
+        if ($coupon->applies_to !== 'specific') {
+            $coupon->products()->sync([]);
+            $coupon->categories()->sync([]);
+
+            return;
+        }
+
+        $coupon->products()->sync($request->input('product_ids', []));
+        $coupon->categories()->sync($request->input('category_ids', []));
+    }
+
+    private function validated(Request $request, ?int $ignoreId = null): array
+    {
+        $data = $request->validate([
+            'code'                    => ['required', 'string', 'max:50', 'unique:coupons,code' . ($ignoreId ? ",{$ignoreId}" : '')],
+            'type'                    => ['required', 'in:percent,fixed'],
+            'value'                   => ['required', 'numeric', 'min:0.01'],
+            'applies_to'              => ['required', 'in:all,specific'],
+            'product_ids'             => ['nullable', 'array'],
+            'product_ids.*'           => ['exists:products,id'],
+            'category_ids'            => ['nullable', 'array'],
+            'category_ids.*'          => ['exists:product_groups,id'],
+            'tld_ids'                 => ['nullable', 'array'],
+            'tld_ids.*'               => ['integer', 'exists:tlds,id'],
+            'title'                   => ['nullable', 'string', 'max:120'],
+            'description'             => ['nullable', 'string', 'max:600'],
+            'min_order'               => ['nullable', 'numeric', 'min:0'],
+            'max_discount'            => ['nullable', 'numeric', 'min:0'],
+            'usage_limit'             => ['nullable', 'integer', 'min:1'],
+            'usage_limit_per_client'  => ['required', 'integer', 'min:1'],
+            'starts_at'               => ['nullable', 'date'],
+            'expires_at'              => ['nullable', 'date', 'after_or_equal:starts_at'],
+            'is_active'               => ['nullable', 'boolean'],
+        ], [
+            'value.min' => 'Nilai kupon harus lebih dari 0.',
         ]);
 
-        $new = new Coupon();
-        $new->name = $request->name;
-        $new->code = $request->code;
-        $new->type = $request->type;
-        /**
-        * For knowing about type 
-        * @see \App\Models\Coupon go to type method 
-        */
-        $new->discount = $request->discount;
-        $new->min_order_amount = $request->min_order_amount;
-        $new->status = 1;
-        $new->save();
+        if ($data['applies_to'] === 'specific' && empty($data['product_ids']) && empty($data['category_ids']) && empty($data['tld_ids'])) {
+            throw \Illuminate\Validation\ValidationException::withMessages([
+                'scope' => 'Pilih minimal satu kategori, produk, atau ekstensi domain untuk kupon "Tertentu".',
+            ]);
+        }
 
-        $notify[] = ['success', 'New coupon added successfully'];
-        return back()->withNotify($notify);
+        // Pilihan TLD hanya berarti untuk kupon "Tertentu"; bila tidak, kosongkan
+        // supaya tidak ada sisa pilihan lama yang mengambang.
+        $data['tld_ids'] = ($data['applies_to'] === 'specific' && ! empty($data['tld_ids']))
+            ? array_values(array_unique(array_map('intval', $data['tld_ids'])))
+            : null;
+
+        // product_ids/category_ids bukan kolom di tabel coupons — disimpan
+        // terpisah lewat syncScope() ke tabel pivot, bukan ikut mass-assign.
+        unset($data['product_ids'], $data['category_ids']);
+
+        return $data;
     }
- 
-    public function update(Request $request){
-
-        $request->validate([
-            'id'=> 'required',
-            'name'=> 'required|max:255',
-            'code'=> 'required|max:255|unique:coupons,code,'.$request->id,
-            'type'=> 'required|in:0,1', 
-            'discount'=> 'required|numeric|gte:0',
-            'min_order_amount'=> 'required|numeric|gte:0',
-            'status' => 'sometimes|in:on'
-        ]);
-
-        $find = Coupon::findOrFail($request->id);
-        $find->name = $request->name;
-        $find->code = $request->code;
-        $find->type = $request->type;
-        /**
-        * For knowing about type 
-        * @see \App\Models\Coupon go to type method 
-        */
-        $find->discount = $request->discount;
-        $find->min_order_amount = $request->min_order_amount;
-        $find->save();
-
-        $notify[] = ['success', 'Coupon updated successfully'];
-        return back()->withNotify($notify);
-    } 
-
-    public function status($id){
-        return Coupon::changeStatus($id);
-    }
-
 }
