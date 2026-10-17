@@ -1,126 +1,143 @@
 <?php
-namespace App\Http\Controllers\Admin\Auth;
 
+namespace App\Http\Controllers\Admin\Auth;
 use App\Http\Controllers\Controller;
-use Illuminate\Foundation\Auth\AuthenticatesUsers;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Str;
 
 class LoginController extends Controller
 {
-    /*
-    |--------------------------------------------------------------------------
-    | Login Controller
-    |--------------------------------------------------------------------------
-    |
-    | This controller handles authenticating users for the application and
-    | redirecting them to your home screen. The controller uses a trait
-    | to conveniently provide its functionality to your applications.
-    |
-    */
-
-    use AuthenticatesUsers;
-
     /**
-     * Where to redirect users after login / registration.
-     *
-     * @var string
+     * URL tujuan setelah login berhasil.
      */
-    public $redirectTo = 'admin';
+    protected string $redirectTo = '/admin';
 
     /**
-     * Show the application's login form.
-     *
-     * @return \Illuminate\Http\Response
+     * Maksimal percobaan login sebelum dibatasi.
+     */
+    protected int $maxAttempts = 5;
+
+    /**
+     * Durasi pembatasan dalam detik.
+     */
+    protected int $decaySeconds = 60;
+
+    /**
+     * Tampilkan halaman login admin.
      */
     public function showLoginForm()
     {
-        $pageTitle = "Admin Login";
+        $pageTitle = 'Admin Login';
+
         return view('admin.auth.login', compact('pageTitle'));
     }
 
     /**
-     * Get the guard to be used during authentication.
-     *
-     * @return \Illuminate\Contracts\Auth\StatefulGuard
+     * Guard autentikasi admin.
      */
     protected function guard()
     {
-        return auth()->guard('admin');
+        return Auth::guard('admin');
     }
 
-    public function username()
+    /**
+     * Nama kolom login admin.
+     */
+    public function username(): string
     {
         return 'username';
     }
 
+    /**
+     * Proses login admin.
+     */
     public function login(Request $request)
     {
+        $credentials = $request->validate([
+            'username' => ['required', 'string', 'max:255'],
+            'password' => ['required', 'string'],
+        ]);
 
-        $this->validateLogin($request);
-
-        $request->session()->regenerateToken();
-
-        if(!verifyCaptcha()){
-            $notify[] = ['error','Invalid captcha provided'];
-            return back()->withNotify($notify);
+        // Pertahankan verifikasi CAPTCHA dari sistem sebelumnya.
+        if (!verifyCaptcha()) {
+            return back()
+                ->withErrors([
+                    'captcha' => 'Invalid captcha provided.',
+                ])
+                ->withInput($request->only('username'));
         }
 
+        $username = Str::lower($credentials['username']);
 
-        $redirect = $request->redirect ?? null;
-        if($redirect){
+        $key = Str::transliterate(
+            $username . '|' . $request->ip()
+        );
 
-            try{ 
-                $validUrl = null;
-                $routes = \Route::getRoutes(); 
-    
-                if(@explode('/', @$request->redirect)[0] != 'admin'){
-                    @$redirect = 'admin'.'/'.$redirect;
-                }
-    
-                $headers = get_headers(route('home').'/'.$redirect);
-                $status = substr($headers[0], 9, 3);
-    
-                if($status != 404){
-               
-                    $requestRedirectUrl = Request::create(@$redirect ?? 'admin');
-                    @$routes->match(@$requestRedirectUrl);
-                    $validUrl = true;
-                       
-                    if($validUrl){
-                        $this->redirectTo = $redirect;
-                    }
-                }
-            }catch(\Exception $e){
-                $validUrl = false;
+        // Cegah percobaan login berulang.
+        if (RateLimiter::tooManyAttempts($key, $this->maxAttempts)) {
+            $seconds = RateLimiter::availableIn($key);
+
+            return back()
+                ->withErrors([
+                    'username' => "Terlalu banyak percobaan login. Coba lagi dalam {$seconds} detik.",
+                ])
+                ->withInput($request->only('username'));
+        }
+
+        // Gunakan guard admin, bukan guard pelanggan.
+        $authenticated = $this->guard()->attempt([
+            'username' => $credentials['username'],
+            'password' => $credentials['password'],
+        ]);
+
+        if (!$authenticated) {
+            RateLimiter::hit($key, $this->decaySeconds);
+
+            return back()
+                ->withErrors([
+                    'username' => 'Username atau password salah.',
+                ])
+                ->withInput($request->only('username'));
+        }
+
+        // Login berhasil: hapus hitungan percobaan dan regenerasi session.
+        RateLimiter::clear($key);
+        $request->session()->regenerate();
+
+        // Hanya izinkan redirect relatif menuju area admin.
+        $redirect = $request->input('redirect');
+
+        if (
+            is_string($redirect) &&
+            $redirect !== '' &&
+            !str_starts_with($redirect, '//') &&
+            !str_contains($redirect, '://')
+        ) {
+            $redirect = ltrim($redirect, '/');
+
+            if (
+                str_starts_with($redirect, 'admin/') &&
+                !str_contains($redirect, '..')
+            ) {
+                return redirect('/' . $redirect);
             }
         }
 
-        // If the class is using the ThrottlesLogins trait, we can automatically throttle
-        // the login attempts for this application. We'll key this by the username and
-        // the IP address of the client making these requests into this application.
-        if (method_exists($this, 'hasTooManyLoginAttempts') &&
-            $this->hasTooManyLoginAttempts($request)) {
-            $this->fireLockoutEvent($request);
-            return $this->sendLockoutResponse($request);
-        }
-
-        if ($this->attemptLogin($request)) {
-            return $this->sendLoginResponse($request);
-        }
-
-        // If the login attempt was unsuccessful we will increment the number of attempts
-        // to login and redirect the user back to the login form. Of course, when this
-        // user surpasses their maximum number of attempts they will get locked out.
-        $this->incrementLoginAttempts($request);
-
-        return $this->sendFailedLoginResponse($request);
+        return redirect($this->redirectTo);
     }
 
-
+    /**
+     * Logout admin.
+     */
     public function logout(Request $request)
     {
-        $this->guard('admin')->logout();
+        $this->guard()->logout();
+
         $request->session()->invalidate();
-        return $this->loggedOut($request) ?: redirect($this->redirectTo);
+        $request->session()->regenerateToken();
+
+        return redirect('/admin');
     }
 }

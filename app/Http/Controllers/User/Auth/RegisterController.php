@@ -9,7 +9,7 @@ use App\Models\AdminNotification;
 use App\Models\User;
 use App\Models\UserLogin;
 use Illuminate\Auth\Events\Registered;
-use Illuminate\Foundation\Auth\RegistersUsers;
+use App\Traits\Auth\RegistersUsers;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;

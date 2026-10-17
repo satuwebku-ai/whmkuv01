@@ -5,7 +5,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ gs()->siteName($pageTitle ?? '404 | page not found') }}</title>
+    <title>{{ gs()?->siteName($pageTitle ?? '404 | page not found') ?? ($pageTitle ?? '404 | Page Not Found') }}</title>
     <link rel="shortcut icon" type="image/png" href="{{ siteFavicon() }}">
     <!-- bootstrap 4  -->
     <link rel="stylesheet" href="{{ asset('assets/global/css/bootstrap.min.css') }}">

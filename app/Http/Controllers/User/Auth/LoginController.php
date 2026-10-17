@@ -5,9 +5,9 @@ namespace App\Http\Controllers\User\Auth;
 use App\Http\Controllers\Controller;
 use App\Lib\Intended;
 use App\Models\UserLogin;
-use Illuminate\Foundation\Auth\AuthenticatesUsers;
+use App\Traits\Auth\AuthenticatesUsers;
 use Illuminate\Http\Request;
-use Status;
+use App\Constants\Status;
 use Illuminate\Support\Facades\Validator;
 
 class LoginController extends Controller

@@ -23,18 +23,46 @@ use Illuminate\Support\Facades\Validator;
 
 class SiteController extends Controller
 {
-    public function index(){
-        $reference = @$_GET['reference'];
-        if ($reference) {
-            session()->put('reference', $reference);
-        }
+    
+public function index()
+{
+    $reference = request()->query('reference');
 
-        $pageTitle = 'Home';
-        $sections = Page::where('tempname',activeTemplate())->where('slug','/')->first();
-        $seoContents = $sections->seo_content;
-        $seoImage = @$seoContents->image ? getImage(getFilePath('seo') . '/' . @$seoContents->image, getFileSize('seo')) : null;
-        return view('Template::home', compact('pageTitle','sections','seoContents','seoImage'));
+    if ($reference) {
+        session()->put('reference', $reference);
     }
+
+    $pageTitle = 'Home';
+
+    $sections = Page::where('tempname', activeTemplate())
+        ->where('slug', '/')
+        ->first();
+
+    if (!$sections) {
+        $sections = Page::where('tempname', activeTemplate())
+            ->where('slug', 'home')
+            ->first();
+    }
+
+    if (!$sections) {
+        abort(404, 'Halaman Home belum tersedia. Silakan periksa data halaman dan template di database.');
+    }
+
+    $seoContents = $sections->seo_content;
+
+    $seoImage = !empty($seoContents->image)
+        ? getImage(
+            getFilePath('seo') . '/' . $seoContents->image,
+            getFileSize('seo')
+        )
+        : null;
+
+    return view(
+        'Template::home',
+        compact('pageTitle', 'sections', 'seoContents', 'seoImage')
+    );
+}
+
 
     public function pages($slug)
     {

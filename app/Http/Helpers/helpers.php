@@ -436,25 +436,36 @@ function dateSorting($arr)
     return $arr;
 }
 
+
 function gs($key = null)
 {
     $general = Cache::get('GeneralSetting');
+
     if (!$general) {
         $general = GeneralSetting::first();
-        Cache::put('GeneralSetting', $general);
+
+        if ($general) {
+            Cache::forever('GeneralSetting', $general);
+        }
     }
 
     if (is_array($key)) {
         $result = [];
+
         foreach ($key as $k) {
-            $result[$k] = @$general->$k;
+            $result[$k] = $general ? ($general->$k ?? null) : null;
         }
+
         return $result;
     }
 
-    if ($key) return @$general->$key;
+    if ($key) {
+        return $general ? ($general->$key ?? null) : null;
+    }
+
     return $general;
 }
+
 
 function isImage($string){
     $allowedExtensions = array('jpg', 'jpeg', 'png', 'gif');
